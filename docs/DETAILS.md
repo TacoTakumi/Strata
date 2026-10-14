@@ -371,8 +371,9 @@ caches, `--peer-device` or the resident low-RAM mode.
 **One card at a time on a layer split.** A split runs with one expert cache per card, so the reserve is per card:
 `POST /v1/vram {"reserve_mib": 16000, "gpu": 1}` shrinks only the cache of GPU 1 (the engine's numbering, 0 = the main card,
 the same numbers as `--split-device`), and leaving `"gpu"` out moves every card of the run. The answer carries one entry per
-card in `"gpus"` plus the totals over the cards it moved; the engine's own stdin line is `VRAM <reserve_mib> [device]`. Only
-that card's layers lose their cached experts. The cache keeps 128 slots plus what the smallest prompt chunk needs, and the
+card in `"gpus"` plus the totals over the cards it moved; the engine's own stdin line is `VRAM <reserve_mib>|- [device]`, the dash standing for the reserve
+the engine started with (a number in that slot is the reserve, so `VRAM 1` is a 1 MiB reserve on every card, not device 1).
+Only that card's layers lose their cached experts. The cache keeps 128 slots plus what the smallest prompt chunk needs, and the
 chunk drops to the largest one every card can still lend. A card's dense weights, session and KV stay put: the split itself
 never moves and nothing is reloaded.
 
