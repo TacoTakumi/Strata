@@ -163,6 +163,17 @@ split's greedy output is the same in either mode.
 **Under WDDM (Windows and WSL2)** only 8 GiB of the expert arena is pinned on a multi-GPU run; the rest streams through the
 pinned staging ring. Linux pins the whole arena. `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
 
+**Giving one card's VRAM to another program** (#533, opt-in). With `"vram_elastic": true` every card's expert cache is
+allocated in 512 MiB segments, so `POST /v1/vram {"reserve_mib": 16000, "gpu": 1}` (the engine's own line is `VRAM 16000 1`)
+shrinks GPU 1's cache between requests until 16 GB is free on that card, and `{"reserve_mib": null, "gpu": 1}` takes it back;
+without `"gpu"` every card of the run moves together. The layers of a card whose cache shrank compute their experts on the
+CPU, so that card's decode slows and the others run as before. A cache never goes below 128 slots plus the smallest prompt
+chunk's buffers, and the chunk drops to the largest one every card can still lend. The split itself never moves: the card
+keeps its dense weights, its session and its KV, and nothing is reloaded. `min_free_vram_mib` reads every card the run will
+use, so a split is not started into a card another program has filled. Measured on a split (2x RTX 3090, Swift 1.5 IQ3_XXS,
+layers 0-23 / 24-47, `"parallel": 2`, `--vram-reserve-mib 700`, 512-token greedy decode): with the cache whole on both cards
+`"vram_elastic": true` and `false` give the same cache (20 091 slots, 33 037 MiB) and 106.6 vs 106.4 tok/s.
+
 ### Overlapped hand-off
 
 By default each verify window runs the stages one after another. `STRATA_SPLIT_OVERLAP=1` (stages on different cards only) gives
