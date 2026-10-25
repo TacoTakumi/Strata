@@ -918,6 +918,14 @@ def visible_device_order(env: dict | None, backend: str | None) -> list[int]:
     return devices if all(0 <= device <= 65535 for device in devices) and len(set(devices)) == len(devices) else []
 
 
+def engine_card_order(cfg: dict, env: dict | None, groups: list[list[int]] | None = None) -> list[int]:
+    """#533: the cards of one engine as nvidia-smi numbers them, in the engine's own order (its GPU 0 first, the
+    --split-device numbering).  That is the visibility list its environment gave it, which ordered_gpus can have
+    changed from the config's "gpu" list (#1352: the faster card last).  With replicas every engine runs its own group:
+    `env` is the first one's, and without a readable list the first group stands for it."""
+    return visible_device_order(env, cfg.get("backend")) or (list(groups[0]) if groups else gpu_list(cfg))
+
+
 def configure_batch_telemetry_env(env: dict, cfg: dict, override: bool | None) -> None:
     """Only an explicit setting changes the inherited opt-in engine environment."""
     choice = override if override is not None else cfg.get("batch_telemetry")
@@ -4415,10 +4423,18 @@ class Service:
         except Exception:
             return None
 
+    def engine_cards(self) -> list[int]:
+        """#533: the cards of one engine, in its own order (engine_card_order); without that, the config's cards -
+        with replicas, one replica's."""
+        groups = getattr(self, "replica_gpu_groups", None)
+        cards = (getattr(self, "engine_gpus", None) or (groups[0] if groups else None)
+                 or getattr(self, "gpu_indices", None) or [0])
+        return [int(i) for i in cards]
+
     def gpu_label(self, device: int | None) -> int:
         """#533: the engine's GPU number (0 = the main card, the --split-device numbering) -> the nvidia-smi number
         the telemetry and the user's `nvidia-smi -i` use."""
-        lst = [int(i) for i in (getattr(self, "gpu_indices", None) or [0])]
+        lst = self.engine_cards()
         d = int(device or 0)
         return lst[d] if 0 <= d < len(lst) else lst[0]
 
@@ -4531,7 +4547,7 @@ class Service:
         GPU in "gpus"}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
-        n = len(getattr(self, "gpu_indices", None) or [0])
+        n = len(self.engine_cards())
         if gpu is not None and not 0 <= int(gpu) < n:
             raise ValueError(f"gpu: this run has {n} GPU{'' if n == 1 else 's'}, numbered 0 to {n - 1}")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
@@ -9190,6 +9206,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if a.engine == "strata" and split:                  # split serving: the two cards (the prefill card first)
         svc.gpu_indices = [split["prefill_gpu"], split["decode_gpu"]]
         svc.gpu_index = split["decode_gpu"]
+    if a.engine == "strata":                            # #533: the cards POST /v1/vram's "gpu" numbers
+        first = (getattr(engine, "engines", None) or [None])[0] if groups else None
+        spawn = getattr(first, "spawn", None)
+        svc.engine_gpus = engine_card_order(cfg, (spawn[4] if spawn and len(spawn) > 4 else None) if groups else env,
+                                            groups)
     svc.terminal_visibility_order = visible_device_order(env, cfg.get("backend")) if a.engine == "strata" else []
     svc.terminal_topology_mode = ("replicas (configured)" if a.engine == "strata" and groups
                                   else "split serve (configured)" if a.engine == "strata" and split
