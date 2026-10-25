@@ -305,6 +305,9 @@ ExpertCache::~ExpertCache() { close(); }
 // ---- #533: the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the
 // runtime (no link against the driver library): one address range for the whole arena, backed by physical segments,
 // and the tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
+namespace {
+std::atomic<int> g_fail_segment_map{-1};   // fail_segment_map_after: the maps left before one fails (-1: none fails)
+}  // namespace
 #if !defined(STRATA_EC_NO_VMM)
 namespace {
 struct Vmm {
@@ -361,6 +364,10 @@ CUmemAllocationProp device_prop(int dev) {
 
 // one segment: a physical allocation mapped at `va`, readable and writable by this device
 bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned long long& handle) {
+    if (const int left = g_fail_segment_map.load(std::memory_order_relaxed); left >= 0) {   // a test's injected failure
+        g_fail_segment_map.store(left - 1, std::memory_order_relaxed);
+        if (left == 0) return false;
+    }
     const CUmemAllocationProp prop = device_prop(dev);
     CUmemGenericAllocationHandle h = 0;
     if (v.create(&h, bytes, &prop, 0) != CUDA_SUCCESS) return false;
@@ -415,6 +422,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
     }
     base_ = reinterpret_cast<uint8_t*>(va);
     reserved_ = total;
+    dev_ = dev;
     for (uint64_t at = 0; at < total; at += (uint64_t) seg_) {
         segs_.push_back(0);
         seg_size_.push_back((int64_t) std::min<uint64_t>((uint64_t) seg_, total - at));
@@ -453,12 +461,16 @@ void ExpertCache::release_segmented() {
     mapped_segs_ = 0;
     reserved_ = 0;
     base_ = nullptr;
+    dev_ = -1;
+    holes_ = 0;
+    seg_hole_.clear();
+    slot_holes_.clear();
 }
 
 int64_t ExpertCache::mapped_bytes() const {
     if (segs_.empty()) return base_ != nullptr ? full_bytes() : 0;
     int64_t b = 0;
-    for (int64_t i = 0; i < mapped_segs_; ++i) b += seg_size_[(size_t) i];
+    for (int64_t i = 0; i < mapped_segs_; ++i) b += segs_[(size_t) i] != 0 ? seg_size_[(size_t) i] : 0;   // not the holes
     return b;
 }
 
@@ -483,6 +495,12 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
     while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
     if (keep >= mapped_segs_) return true;
+    for (int64_t i = mapped_segs_ - 1; holes_ > 0 && i >= keep; --i)
+        if (seg_hole_[(size_t) i]) {   // its VRAM is someone else's until map_segments: the tail stops above it
+            err = "an unmapped segment set lies in the tail this shrink would give back (keep at least " +
+                  std::to_string(((int64_t) i + 1) * seg_) + " bytes, or map it back first)";
+            return false;
+        }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
@@ -493,13 +511,13 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         if (v.unmap(p, (size_t) seg_size_[(size_t) i]) != CUDA_SUCCESS ||
             v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]) != CUDA_SUCCESS) {
             err = "the driver refused to release an expert-cache segment";
-            live_slots_ = slots_within(mapped_bytes());
+            live_slots_ = slots_within(prefix_bytes());
             return false;
         }
         segs_[(size_t) i] = 0;
         mapped_segs_ = i;
     }
-    live_slots_ = slots_within(mapped_bytes());
+    live_slots_ = slots_within(prefix_bytes());
     return true;
 #endif
 }
@@ -525,21 +543,157 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
     int dev = 0;
     cudaGetDevice(&dev);
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
-    int64_t at = mapped_bytes();
+    int64_t at = prefix_bytes();   // the holes below the tail count: a grow maps the tail only, never a hole
     while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
         const size_t i = (size_t) mapped_segs_;
         if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
                          segs_[i])) {
             (void) cudaGetLastError();
             err = "the driver has no VRAM for another expert-cache segment";
-            live_slots_ = slots_within(mapped_bytes());
+            live_slots_ = slots_within(prefix_bytes());
             return false;
         }
         at += seg_size_[i];
         ++mapped_segs_;
     }
-    live_slots_ = slots_within(mapped_bytes());
+    live_slots_ = slots_within(prefix_bytes());
     return true;
+#endif
+}
+
+// Segment sets (see the header): holes anywhere below the tail, unmapped and mapped back whole.
+int64_t ExpertCache::prefix_bytes() const {
+    int64_t b = 0;
+    for (int64_t i = 0; i < mapped_segs_; ++i) b += seg_size_[(size_t) i];
+    return b;
+}
+
+void ExpertCache::segment_slots(int64_t i, int64_t& lo, int64_t& hi) const {
+    lo = hi = 0;
+    if (i < 0 || i >= segments() || slots_ <= 0) return;
+    const uint64_t a = (uint64_t) i * (uint64_t) seg_, b = a + (uint64_t) seg_size_[(size_t) i];
+    lo = slots_within((int64_t) a);   // the slots that end at or before the segment's start do not touch it
+    if (off_.empty()) {
+        hi = blob_ > 0 ? (int64_t) ((b + (uint64_t) blob_ - 1) / (uint64_t) blob_) : 0;
+        hi = hi > slots_ ? slots_ : hi;
+    } else {   // the slots that start before its end
+        hi = (int64_t) (std::lower_bound(off_.begin(), off_.begin() + slots_, b) - off_.begin());
+    }
+    if (hi < lo) hi = lo;
+}
+
+int64_t ExpertCache::usable_slots() const {
+    if (holes_ == 0) return live_slots_;
+    int64_t n = 0;
+    for (int64_t s = 0; s < live_slots_; ++s) n += slot_holes_[(size_t) s] == 0;
+    return n;
+}
+
+namespace {
+// the segment set `segs` has no repeats and every index passes `ok`
+template <class Ok> bool segment_set_ok(const std::vector<int64_t>& segs, int64_t n, Ok ok) {
+    std::vector<uint8_t> seen((size_t) n, 0);
+    for (const int64_t i : segs) {
+        if (i < 0 || i >= n || seen[(size_t) i] || !ok(i)) return false;
+        seen[(size_t) i] = 1;
+    }
+    return true;
+}
+}  // namespace
+
+void ExpertCache::fail_segment_map_after(int n) { g_fail_segment_map.store(n < 0 ? -1 : n); }
+
+bool ExpertCache::unmap_segments(const std::vector<int64_t>& segs, std::string& err) {
+    int dev = -1;
+    if (segs_.empty() || cudaGetDevice(&dev) != cudaSuccess || dev != dev_) {
+        err = segs_.empty() ? "the expert cache is not segmented" : "the expert cache lives on another device";
+        return false;
+    }
+    if (!segment_set_ok(segs, segments(), [&](int64_t i) { return i < mapped_segs_ && segs_[(size_t) i] != 0; })) {
+        err = "a segment to unmap is outside the live arena, already unmapped or named twice";
+        return false;
+    }
+#if defined(STRATA_EC_NO_VMM)
+    return false;
+#else
+    if (segs.empty()) return true;
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("the device failed before the segments were unmapped: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (seg_hole_.empty()) {   // the first hole: from here on the per-slot counts exist
+        seg_hole_.assign(segs_.size(), 0);
+        slot_holes_.assign((size_t) slots_, 0);
+    }
+    const Vmm& v = vmm();
+    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
+    for (const int64_t i : segs) {
+        const CUdeviceptr p = va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_);
+        if (v.unmap(p, (size_t) seg_size_[(size_t) i]) != CUDA_SUCCESS ||
+            v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]) != CUDA_SUCCESS) {
+            err = "the driver refused to release expert-cache segment " + std::to_string(i);
+            return false;
+        }
+        segs_[(size_t) i] = 0;
+        seg_hole_[(size_t) i] = 1;
+        ++holes_;
+        int64_t lo = 0, hi = 0;
+        segment_slots(i, lo, hi);
+        for (int64_t s = lo; s < hi; ++s) ++slot_holes_[(size_t) s];
+    }
+    return true;
+#endif
+}
+
+ExpertCache::MapResult ExpertCache::map_segments(const std::vector<int64_t>& segs, std::string& err) {
+    int dev = -1;
+    if (segs_.empty() || cudaGetDevice(&dev) != cudaSuccess || dev != dev_) {
+        err = segs_.empty() ? "the expert cache is not segmented" : "the expert cache lives on another device";
+        return MapResult::refused;
+    }
+    if (!segment_set_ok(segs, segments(), [&](int64_t i) { return !seg_hole_.empty() && seg_hole_[(size_t) i]; })) {
+        err = "a segment to map is not unmapped by unmap_segments or is named twice";
+        return MapResult::refused;
+    }
+#if defined(STRATA_EC_NO_VMM)
+    return MapResult::refused;
+#else
+    const Vmm& v = vmm();
+    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
+    auto at = [&](int64_t i) { return va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_); };
+    size_t done = 0;
+    for (; done < segs.size(); ++done) {
+        const int64_t i = segs[done];
+        if (!map_segment(v, dev_, at(i), (size_t) seg_size_[(size_t) i], segs_[(size_t) i])) break;
+    }
+    if (done < segs.size()) {   // all or nothing: release what this call mapped, every hole stays as it was
+        (void) cudaGetLastError();
+        err = "the driver has no VRAM for expert-cache segment " + std::to_string(segs[done]);
+        for (size_t k = done; k-- > 0;) {
+            const int64_t i = segs[k];
+            if (v.unmap(at(i), (size_t) seg_size_[(size_t) i]) == CUDA_SUCCESS) {
+                v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]);   // refused: only the handle leaks
+                segs_[(size_t) i] = 0;
+                continue;
+            }
+            // the driver will not take it back: it stays mapped, and the books say so
+            err += "; segment " + std::to_string(i) + " could not be released again and stays mapped";
+            seg_hole_[(size_t) i] = 0;
+            --holes_;
+            int64_t lo = 0, hi = 0;
+            segment_slots(i, lo, hi);
+            for (int64_t s = lo; s < hi; ++s) --slot_holes_[(size_t) s];
+        }
+        return MapResult::busy;
+    }
+    for (const int64_t i : segs) {
+        seg_hole_[(size_t) i] = 0;
+        --holes_;
+        int64_t lo = 0, hi = 0;
+        segment_slots(i, lo, hi);
+        for (int64_t s = lo; s < hi; ++s) --slot_holes_[(size_t) s];
+    }
+    return MapResult::ok;
 #endif
 }
 
