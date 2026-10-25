@@ -41,6 +41,9 @@ EDITABLE = [
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
      "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+    ("vram_lend", "bool",
+     "VRAM Lend: other programs borrow expert-cache VRAM through POST /vram/lend while requests run, and give it back "
+     "through POST /vram/return (from the next start)"),
     ("vram_elastic", "bool",
      "The expert cache in segments, so POST /v1/vram can give VRAM to another program between requests (from the next start)"),
     ("vram_segment_mib", "int>=0",
