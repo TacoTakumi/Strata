@@ -695,6 +695,9 @@ struct Options {
     /// segments as with --vram-elastic (a lease is whole segments), decode runs the serial loop, and the engine names
     /// each card's PCI address before READY.  It does not turn on the VRAM command: that stays --vram-elastic's.
     bool vram_lend = false;
+    /// --vram-lend was given: the lend lines are answered also when VRAM Lend is off (a build, a GPU or a setting
+    /// that cannot lend), every GPU with nothing to lend, so the server never waits for an answer that does not come.
+    bool vram_lend_lines = false;
     /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
     /// A card that drives no display needs less than the one the monitors are on.
     int vram_reserve_later_mib = -1;
@@ -3154,7 +3157,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
-        else if (a == "--vram-lend") o.vram_lend = true;
+        else if (a == "--vram-lend") o.vram_lend = o.vram_lend_lines = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
@@ -3353,11 +3356,11 @@ int main(int argc, char** argv) {
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)   // no CUDA virtual memory
         if (why == nullptr) why = "it is NVIDIA-only for now";
 #endif
         if (why != nullptr) {
-            std::fprintf(stderr, "strata generate: --vram-lend is off: %s\n", why);
+            std::fprintf(stderr, "strata generate: --vram-lend is off: %s (every GPU answers nothing to lend)\n", why);
             o.vram_lend = false;
         } else {
             if (o.pipeline_windows > 0)
@@ -7086,7 +7089,15 @@ int main(int argc, char** argv) {
     }
     // VRAM Lend: a lease is whole segments of a card's cache, so it takes the same segmented cache on every card (its
     // own conditions were checked at the start)
-    if (o.vram_lend) xcache.set_segment_bytes(o.vram_segment_mib << 20);
+    // A card whose GPU or driver has no virtual memory management keeps the one allocation and lends nothing.
+    auto lend_segments = [&](int dev) {
+        if (!o.vram_lend) return false;
+        if (strata::core::ExpertCache::segments_supported(dev)) return true;
+        std::fprintf(stderr, "strata generate: VRAM Lend: CUDA%d has no virtual memory management: its expert cache is "
+                             "not segmented and lends nothing\n", dev);
+        return false;
+    };
+    if (!o.vram_elastic && lend_segments(primary_device)) xcache.set_segment_bytes(o.vram_segment_mib << 20);
     // STRATA_MMQ_DIRECT: the guard after each sized slot (kept across the retry loop's close/open)
     xcache.set_slot_guard(slot_guard);
     if (slot_guard > 0 && o.expert_cache > 0) {
@@ -7384,7 +7395,7 @@ int main(int argc, char** argv) {
             used += b;
             sized.push_back((int64_t) nib::slot_bytes(pr.first));
         }
-        if (o.vram_elastic || o.vram_lend) st.cache.set_segment_bytes(o.vram_segment_mib << 20);   // #533: one segmented cache per GPU
+        if (o.vram_elastic || lend_segments(st.dev)) st.cache.set_segment_bytes(o.vram_segment_mib << 20);   // #533: one segmented cache per GPU
         // #841: a stage's cache can fail to open with the VRAM free (the card's allocation is also charged to the
         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
         // try said.  Nothing changes when the first open works.
@@ -12021,8 +12032,8 @@ int main(int argc, char** argv) {
             strata::core::LendQueue lend;
         };
         const auto in_shared = std::make_shared<StdinShared>();
-        in_shared->lend_on = o.vram_lend;   // (before the reader starts)
-        strata::core::LendQueue* const lend_q = o.vram_lend ? &in_shared->lend : nullptr;   // null: no lending
+        in_shared->lend_on = o.vram_lend_lines;   // (before the reader starts)
+        strata::core::LendQueue* const lend_q = o.vram_lend_lines ? &in_shared->lend : nullptr;   // null: no lend lines
         std::atomic<bool>& stop_req = in_shared->stop_req;
         std::mutex& in_mu = in_shared->mu;
         std::condition_variable& in_cv = in_shared->cv;
@@ -12237,7 +12248,7 @@ int main(int argc, char** argv) {
         // started without --vram-lend)
         std::unique_ptr<strata::core::SegmentLendCache<strata::core::ExpertCache>> lend_cache;
         std::unique_ptr<strata::core::LendCommands> lends;
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // (cudaDeviceGetPCIBusId)
         // VRAM Lend: one line per GPU that holds an expert cache, the main card first, then the stages: the engine's
         // GPU number (as the VRAM command's: 0 is the main card, a later stage its CUDA number) and the PCI address
         // CUDA gives that card, so the server names a GPU by its address whatever CUDA_VISIBLE_DEVICES and the
@@ -12300,6 +12311,16 @@ int main(int argc, char** argv) {
             lends = std::make_unique<strata::core::LendCommands>(*lend_cache);
         }
 #endif
+        // --vram-lend given, VRAM Lend off (see where it was turned off): the lend lines are answered all the same,
+        // every GPU listed with nothing to lend - LENDABLE 0, a LEND refused with ERR MAX 0
+        const strata::core::ExpertCache unsegmented;   // never opened: the figures of a cache with no segments
+        std::unique_ptr<strata::core::SegmentLendCache<strata::core::ExpertCache>> no_lend;
+        if (o.vram_lend_lines && lends == nullptr) {
+            no_lend = std::make_unique<strata::core::SegmentLendCache<strata::core::ExpertCache>>();
+            no_lend->add(0, unsegmented, 0, 0);
+            for (const auto& st : stages) no_lend->add(st->dev, unsegmented, 0, 0);
+            lends = std::make_unique<strata::core::LendCommands>(*no_lend);
+        }
         // a lend command's answer: whole lines from the main thread between two steps, never inside a request's lines
         auto lend_reply = [&](const std::string& l) {
             std::string reply;

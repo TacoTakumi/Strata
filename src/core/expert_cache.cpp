@@ -390,6 +390,24 @@ bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned l
 }  // namespace
 #endif
 
+bool ExpertCache::segments_supported(int dev) {
+#if defined(STRATA_EC_NO_VMM)
+    (void) dev;
+    return false;
+#else
+    int n = 0, supported = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    const Vmm& v = vmm();
+    CUdevice cu = 0;
+    return dev >= 0 && dev < n && v.ok && v.device_get(&cu, dev) == CUDA_SUCCESS &&
+           v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) == CUDA_SUCCESS &&
+           supported != 0;
+#endif
+}
+
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 #if defined(STRATA_EC_NO_VMM)
     (void) want;
@@ -613,7 +631,8 @@ bool ExpertCache::unmap_segments(const std::vector<int64_t>& segs, std::string& 
         err = "a segment to unmap is outside the live arena, already unmapped or named twice";
         return false;
     }
-#if defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_EC_NO_VMM)   // (not reached: such a build never segments a cache)
+    err = "the expert cache's segments are CUDA-only";
     return false;
 #else
     if (segs.empty()) return true;
@@ -655,7 +674,8 @@ ExpertCache::MapResult ExpertCache::map_segments(const std::vector<int64_t>& seg
         err = "a segment to map is not unmapped by unmap_segments or is named twice";
         return MapResult::refused;
     }
-#if defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_EC_NO_VMM)   // (not reached: such a build never segments a cache)
+    err = "the expert cache's segments are CUDA-only";
     return MapResult::refused;
 #else
     const Vmm& v = vmm();

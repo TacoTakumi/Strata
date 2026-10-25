@@ -125,6 +125,10 @@ public:
     /// always.  CUDA only: a HIP build refuses it at open.  The slots past `slots()` after a shrink must hold no
     /// resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
+    /// Device `dev` can hold a segmented cache: the driver's virtual memory management is there and the device
+    /// supports it.  False on HIP, gfx906 and Metal, and for a device that does not exist.  (The SYCL engine's own
+    /// expert_cache.cpp has no segments and does not define it.)
+    static bool segments_supported(int dev);
     /// STRATA_MMQ_DIRECT: `open_sized` leaves at least `g` bytes of room after each slot's blob (the prompt MMQ
     /// reads a little past a down matrix when it reads an expert in its slot).  Set before opening, like
     /// `set_segment_bytes`; `close` keeps it.  0 (the default): no guard.  The uniform `open` ignores it, and so does

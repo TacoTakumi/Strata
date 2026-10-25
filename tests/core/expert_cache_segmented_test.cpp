@@ -6,7 +6,10 @@
 // Segment sets: whole segments unmapped and mapped back anywhere in the live arena (holes), a slot that straddles two
 // holes usable only when both are back, a map that fails part-way undone (busy, nothing changed), the driver's free
 // figure moving by exactly the bytes unmapped or mapped, and the tail's shrink and grow beside the holes.
+// VRAM Lend over a cache that is not segmented (a GPU or a build without virtual memory management): every card is
+// listed with nothing to lend, and a LEND is refused with ERR MAX 0.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/vram_lend.hpp"
 #include "strata/program/vram_rules.hpp"
 
 #include <cuda_runtime.h>
@@ -279,6 +282,12 @@ int main() {
         return 77;
     }
     constexpr int64_t kBlob = 1 << 20, kSlots = 96, kSeg = 8ll << 20;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) return fail("cudaGetDevice");
+    // the check the engine makes before it segments a card's cache for VRAM Lend: it agrees with the segmented open
+    const bool vmm = strata::core::ExpertCache::segments_supported(dev);
+    if (strata::core::ExpertCache::segments_supported(-1) || strata::core::ExpertCache::segments_supported(n))
+        return fail("segments_supported: a device that does not exist");
     for (int sized = 0; sized < 2; ++sized) {
         strata::core::ExpertCache c;
         c.set_segment_bytes(kSeg);
@@ -289,12 +298,14 @@ int main() {
             // #1475: a HIP build has no segmented cache ("--vram-elastic ... is CUDA-only for now"): a skip, not a failure
             if (err.find("virtual memory management") != std::string::npos ||
                 err.find("CUDA-only") != std::string::npos) {
+                if (vmm) return fail("segments_supported says yes, the segmented open says no", err);
                 std::printf("%s: skipped\n", err.c_str());
                 return 77;
             }
             return fail("open", err);
         }
         if (!c.segmented() || c.slots() != kSlots || c.mapped_bytes() < kSlots * kBlob) return fail("open sizes");
+        if (!vmm) return fail("segments_supported says no, the segmented open worked");
         uint8_t* const first = c.device_slot(0);
         if (!fill(c, 0, kSlots, kBlob)) return fail("fill");
         const size_t before = free_vram();
@@ -327,6 +338,23 @@ int main() {
     if (d.unmap_segments({0}, err) || d.map_segments({0}, err) != strata::core::ExpertCache::MapResult::refused ||
         d.usable_slots() != 8 || !d.slot_usable(7))
         return fail("unsegmented: segment sets");
+    {   // VRAM Lend over caches that are not segmented (the open one and one never opened): listed, nothing to lend
+        strata::core::ExpertCache never;
+        strata::core::SegmentLendCache<strata::core::ExpertCache> lc;
+        lc.add(0, d, 0, 0);
+        lc.add(1, never, 0, 0);
+        lc.add(2, d, 128, 4);
+        strata::core::LendCommands desk(lc);
+        std::string r;
+        if (!desk.handle("LENDABLE", r) ||
+            r != "LENDABLE dev=0 lendable=0 lent=0\nLENDABLE dev=1 lendable=0 lent=0\nLENDABLE dev=2 lendable=0 lent=0\nEND\n")
+            return fail("unsegmented: LENDABLE", r);
+        for (const char* l : {"LEND 0 1", "LEND 1 512", "LEND 2 99999"})
+            if (!desk.handle(l, r) || r != "ERR MAX 0\n") return fail("unsegmented: LEND", r);
+        if (!desk.handle("LEND 3 1", r) || r != "ERR NODEV 3\n") return fail("unsegmented: LEND to no card", r);
+        if (!desk.handle("RETURN 1", r) || r != "ERR UNKNOWN 1\n" || desk.open_leases() != 0)
+            return fail("unsegmented: RETURN", r);
+    }
     if (vram_error_paths() != 0) return 1;
     if (segment_sets(false) != 0 || segment_sets(true) != 0) return 1;
     std::puts("expert cache segments: shrink gives VRAM back and keeps the slots, grow maps them again; a failed "
