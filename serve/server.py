@@ -3294,6 +3294,25 @@ def engine_args(cfg: dict) -> list[str]:
     return learned_profile_args(cfg, args)
 
 
+def vision_elastic_note(cfg: dict) -> str | None:
+    """Why the vision section's "elastic": true is not taken (the encoder then starts with the model), or None.  It
+    borrows its VRAM through #533's reserve, which cuts the expert cache's tail: that needs "vram_elastic", and with
+    VRAM Lend on the tail's segments are the leases' to lend, so it is resident there (the Intel engine starts
+    without VRAM Lend, see engine_args)."""
+    if (cfg.get("vision") or {}).get("elastic") is not True:
+        return None
+    args = list(cfg.get("args") or [])
+    if cfg.get("user_args"):
+        args = user_args.merge(args, cfg["user_args"])
+    if not sycl_engine(cfg) and (cfg.get("vram_lend") is True or "--vram-lend" in args):
+        return ('[strata] the vision section\'s "elastic" is off with VRAM Lend ("vram_lend": true: other programs '
+                "borrow the expert cache's VRAM through its leases): the encoder starts with the model instead")
+    if cfg.get("vram_elastic") is not True:
+        return ('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
+                "encoder its VRAM): the encoder starts with the model instead")
+    return None
+
+
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
@@ -4617,10 +4636,15 @@ class Service:
         started with), applied between requests - a request that is running finishes first (up to wait_s).  `gpu` is
         the engine's GPU number (0 = the main card, the same numbers as --split-device); None: every GPU of the run.
         Only an engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on
-        its own.  An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures, one per
-        GPU in "gpus"}."""
+        its own, and not with VRAM Lend (--vram-lend): the leases own the cache's segments that a resize would cut.  An
+        unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures, one per GPU in
+        "gpus"}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
+        if getattr(self.engine, "lending", False) is True:
+            raise ValueError("POST /v1/vram is off with VRAM Lend (--vram-lend, the config's \"vram_lend\": true): "
+                             "other programs borrow the expert cache's VRAM through POST /vram/lend and give it back "
+                             "through POST /vram/return")
         n = len(self.engine_cards())
         if gpu is not None and not 0 <= int(gpu) < n:
             raise ValueError(f"gpu: this run has {n} GPU{'' if n == 1 else 's'}, numbered 0 to {n - 1}")
@@ -9039,7 +9063,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+            elastic_off = vision_elastic_note(cfg)     # #533's reserve, or VRAM Lend's leases, decide (one line why)
+            elastic = cfg["vision"].get("elastic") is True and elastic_off is None
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
                   "loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -9049,9 +9074,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
             if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
                 vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
+            if elastic_off is not None:
+                print(elastic_off, flush=True)
                 vcfg["elastic"] = False
             elif vcfg.get("elastic") is True and layer_split_of(cfg):
                 # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts

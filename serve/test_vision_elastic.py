@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, Vision
+from serve.server import ByteTokenizer, EngineDied, Service, Vision, vision_elastic_note
 from serve.test_vram import VramEngine
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,11 +60,11 @@ class Elastic(unittest.TestCase):
 
     def test_the_first_picture_makes_room_then_starts_the_encoder(self):
         self.picture()
-        self.assertEqual(self.engine.calls, [2048])         # the cache keeps the encoder's share free first
+        self.assertEqual(self.engine.calls, [(2048, None)])  # the cache keeps the encoder's share free first
         self.assertEqual(self.vision.starts, 1)
         self.assertTrue(self.svc.vision_held)
         self.picture()                                      # the next one uses the running encoder
-        self.assertEqual(self.engine.calls, [2048])
+        self.assertEqual(self.engine.calls, [(2048, None)])
         self.assertEqual(self.vision.starts, 1)
 
     def test_an_idle_encoder_stops_and_the_cache_grows_back_whole(self):
@@ -76,21 +76,21 @@ class Elastic(unittest.TestCase):
         self.assertEqual(self.svc._vision_idle_down(), "down")
         self.assertFalse(self.vision.up)
         self.assertFalse(self.svc.vision_held)
-        self.assertEqual(self.engine.calls, [2048, 0])      # 0, not None: the full size, not the start's reserve
+        self.assertEqual(self.engine.calls, [(2048, None), (0, None)])   # 0, not None: the full size, not the start's reserve
         self.assertEqual(self.svc._vision_idle_down(), "nothing")
         self.picture()                                      # and the next picture starts it again
         self.assertEqual(self.vision.starts, 2)
-        self.assertEqual(self.engine.calls, [2048, 0, 2048])
+        self.assertEqual(self.engine.calls, [(2048, None), (0, None), (2048, None)])
 
     def test_a_vram_reserve_stacks_on_the_encoders_share(self):
         self.svc.vram(4000)
         self.picture()
-        self.assertEqual(self.engine.calls, [4000, 6048])
+        self.assertEqual(self.engine.calls, [(4000, None), (6048, None)])
         self.svc.vram(1000)                                 # asked while the encoder runs
-        self.assertEqual(self.engine.calls[-1], 3048)
+        self.assertEqual(self.engine.calls[-1], (3048, None))
         self.svc.last_image_at = 0
         self.svc._vision_idle_down()
-        self.assertEqual(self.engine.calls[-1], 1000)       # back to the asked reserve, not to 0
+        self.assertEqual(self.engine.calls[-1], (1000, None))   # back to the asked reserve, not to 0
 
     def test_an_engine_that_cannot_shrink_still_gets_its_encoder(self):
         self.engine.elastic = False
@@ -99,7 +99,7 @@ class Elastic(unittest.TestCase):
         self.assertFalse(self.svc.vision_held)
         self.svc.last_image_at = 0
         self.assertEqual(self.svc._vision_idle_down(), "down")
-        self.assertEqual(self.engine.calls, [2048])         # the refused shrink only: nothing to give back
+        self.assertEqual(self.engine.calls, [(2048, None)])  # the refused shrink only: nothing to give back
 
     def test_an_encoder_that_fails_to_start_is_a_503_not_a_dropped_connection(self):
         def fail():
@@ -110,7 +110,7 @@ class Elastic(unittest.TestCase):
         self.assertIn("the image encoder failed to start", str(e.exception))
         self.svc.last_image_at = 0
         self.assertEqual(self.svc._vision_idle_down(), "down")
-        self.assertEqual(self.engine.calls, [2048, 0])      # the share made for it goes back
+        self.assertEqual(self.engine.calls, [(2048, None), (0, None)])  # the share made for it goes back
 
     def test_the_stop_is_logged_when_the_cache_never_made_room(self):
         self.engine.elastic = False                         # a layer split: the engine refuses --vram-elastic
@@ -132,6 +132,18 @@ class Elastic(unittest.TestCase):
         self.assertEqual(self.svc.unload(), "unloaded")
         self.assertFalse(self.svc.vision_held)
         self.assertFalse(self.vision.up)
+
+    def test_vram_lend_starts_the_encoder_with_the_model(self):
+        """With VRAM Lend on the expert cache's segments belong to the leases, so the encoder does not borrow through
+        the VRAM reserve: it is resident, with one line saying why.  With it off the elastic encoder works as before."""
+        cfg = {"args": [], "vram_elastic": True, "vision": {"elastic": True}}
+        self.assertIsNone(vision_elastic_note(cfg))                              # VRAM Lend off: elastic
+        for on in ({**cfg, "vram_lend": True}, {**cfg, "args": ["--vram-lend"]}, {**cfg, "user_args": ["--vram-lend"]}):
+            self.assertIn("VRAM Lend", vision_elastic_note(on))
+            self.assertIn("starts with the model", vision_elastic_note(on))
+        self.assertIsNone(vision_elastic_note({**cfg, "vram_lend": True, "backend": "sycl"}))   # starts without it
+        self.assertIsNone(vision_elastic_note({**cfg, "vram_lend": True, "vision": {}}))       # not elastic
+        self.assertIn('"vram_elastic"', vision_elastic_note({"args": [], "vision": {"elastic": True}}))   # as before
 
     def test_the_config_keys(self):
         v = Vision({"exe": "e", "mmproj": "m", "model": "t", "elastic": True, "elastic_mib": 3000,

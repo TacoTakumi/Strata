@@ -693,7 +693,8 @@ struct Options {
     int64_t vram_segment_mib = 512;
     /// VRAM Lend (opt-in): other programs borrow expert-cache VRAM while requests run.  Every card's cache is in
     /// segments as with --vram-elastic (a lease is whole segments), decode runs the serial loop, and the engine names
-    /// each card's PCI address before READY.  It does not turn on the VRAM command: that stays --vram-elastic's.
+    /// each card's PCI address before READY.  It refuses the VRAM command, also with --vram-elastic: a resize cuts the
+    /// same segments a lease holds.
     bool vram_lend = false;
     /// --vram-lend was given: the lend lines are answered also when VRAM Lend is off (a build, a GPU or a setting
     /// that cannot lend), every GPU with nothing to lend, so the server never waits for an answer that does not come.
@@ -12497,6 +12498,12 @@ int main(int argc, char** argv) {
         // what each cache gave up, per target: (residency index, slot) the shrinks took, so a grow puts them back
         std::vector<std::vector<std::pair<int32_t, int32_t>>> vram_evicted(1 + stages.size());
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
+            // VRAM Lend: its leases own whole segments of the caches, and a resize cuts the same tails - refused with
+            // --vram-lend, also when --vram-elastic is given too (the server's POST /v1/vram says so before asking)
+            if (o.vram_lend_lines) {
+                e = "VRAM is off with VRAM Lend (--vram-lend): other programs borrow expert-cache VRAM through its leases";
+                return false;
+            }
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib), on every card of the run.
             // `VRAM - [device]`: that reserve named so a device can follow it.  The dash is the only way to say
             // "the start's reserve, on this one card": a number in the first slot IS the reserve, so the server's
@@ -12530,10 +12537,6 @@ int main(int argc, char** argv) {
             for (const VramTarget& t : vram_targets())
                 if (want_dev < 0 || t.dev == want_dev) targets.push_back(t);
             if (targets.empty()) { e = "VRAM: this run has no GPU " + std::to_string(want_dev); return false; }
-            if (o.vram_lend && !o.vram_elastic) {   // its segments are for leases: the VRAM command does not move them
-                e = "VRAM needs an engine started with --vram-elastic (--vram-lend segments the caches for its leases)";
-                return false;
-            }
             for (const VramTarget& t : targets)
                 if (!t.cache->segmented()) {
                     e = targets.size() == 1 && t.idx == 0

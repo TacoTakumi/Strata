@@ -223,6 +223,20 @@ class Route(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("--vram-elastic", body["error"]["message"])
 
+    def test_vram_lend_refuses_the_resize(self):
+        """With VRAM Lend on (--vram-lend) the leases own the cache's segments: a resize would cut the same tail, so
+        the route answers 400 naming VRAM Lend, loaded or not, and never waits for a running request first."""
+        self.engine.lending = True
+        self.svc.vram_wait_s = 0.2
+        for loaded in (True, False):
+            self.engine.loaded = loaded
+            with self.svc.fifo:                               # a request is running: the answer does not wait for it
+                code, body = self.request("/v1/vram", {"reserve_mib": 4000, "gpu": 1})
+            self.assertEqual(code, 400, body)
+            self.assertIn("VRAM Lend", body["error"]["message"])
+        self.assertEqual(self.engine.calls, [])
+        self.assertIsNone(self.svc.vram_reserve)              # nothing kept for the next load either
+
     def test_unloaded_keeps_the_reserve_for_the_next_load(self):
         code, body = self.request("/v1/vram", {"reserve_mib": 5000, "gpu": 1})
         self.assertEqual(code, 200)
