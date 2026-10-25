@@ -3120,6 +3120,12 @@ def engine_binary(exe: str, cfg: dict | None = None) -> str:
     return exe
 
 
+def sycl_engine(cfg: dict) -> bool:
+    """The config runs the Intel engine (sycl/): setup_intel writes "backend": "sycl" and its launcher as the exe."""
+    exe = cfg.get("exe")
+    return cfg.get("backend") == "sycl" or (isinstance(exe, str) and Path(exe).name == "strata-sycl.sh")
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -3274,8 +3280,14 @@ def engine_args(cfg: dict) -> list[str]:
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
     # VRAM Lend (opt-in): "vram_lend": true - other programs borrow expert-cache VRAM through POST /vram/lend and
-    # give it back through POST /vram/return while requests run (serve/vram_lend.py)
-    if cfg.get("vram_lend") is True and "--vram-lend" not in args:
+    # give it back through POST /vram/return while requests run (serve/vram_lend.py).  The Intel engine has no VRAM
+    # Lend and refuses the flag as an unknown argument: it starts without it, and the /vram routes lend nothing
+    if sycl_engine(cfg):
+        if cfg.get("vram_lend") is True or "--vram-lend" in args:
+            args = [a for a in args if a != "--vram-lend"]
+            print("[strata] VRAM Lend is not available on the Intel (SYCL) engine: starting without --vram-lend",
+                  flush=True)
+    elif cfg.get("vram_lend") is True and "--vram-lend" not in args:
         args.append("--vram-lend")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
