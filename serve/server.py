@@ -3712,6 +3712,35 @@ def sycl_engine(cfg: dict) -> bool:
     return cfg.get("backend") == "sycl" or (isinstance(exe, str) and Path(exe).name == "strata-sycl.sh")
 
 
+_ENGINE_KNOWS: dict = {}
+
+
+def engine_knows(exe: str, cfg: dict | None, flag: str) -> bool:
+    """The engine names `flag` (its usage text is in the binary): an engine older than the server, or another model's
+    engine, ends at the start on an option it does not know.  Read once per binary (its path, size and time) and
+    flag; False when the file cannot be read."""
+    path = engine_binary(exe, cfg)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    key = (os.path.abspath(path), st.st_size, st.st_mtime_ns, flag)
+    if key not in _ENGINE_KNOWS:
+        want, tail, found = flag.encode(), b"", False
+        try:
+            with open(path, "rb") as f:
+                while not found:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    found = want in tail + chunk
+                    tail = chunk[1 - len(want):] if len(want) > 1 else b""
+        except OSError:
+            return False
+        _ENGINE_KNOWS[key] = found
+    return _ENGINE_KNOWS[key]
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -3722,11 +3751,7 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
     if pos == "start":
         return None
-    try:
-        with open(engine_binary(exe, cfg), "rb") as f:
-            known = b"--tail-role-token" in f.read()
-    except OSError:
-        known = False
+    known = engine_knows(exe, cfg, "--tail-role-token")
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
         print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
@@ -3829,44 +3854,53 @@ def drafting_vram_mib(cfg: dict, backend: str | None, archs) -> float | None:
         return None
 
 
-def mtp_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None) -> list[str] | None:
+def mtp_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None, *, lend: bool = True) -> list[str] | None:
     """The arguments to start again with when an Auto start that picked DFlash2 ends before the engine is ready: the same start with the MTP (or no drafter, when
     the MTP layer is not on this computer). None when there is nothing to retry: the person named DFlash2 themselves (that start fails with its reason, as it
     should), the choice was not DFlash2, or the MTP arguments are the same. Builds the arguments without any line or note (engine_args announce=False)."""
     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
         return None
     try:
-        first = engine_args(cfg, exe, announce=False)
+        first = engine_args(cfg, exe, announce=False, lend=lend)
         if "--draft" not in first or first[first.index("--draft") + 1:first.index("--draft") + 2] != ["dflash2"]:
             return None
-        alt = engine_args({**cfg, "drafting": "mtp"}, exe, announce=False) + list(extra or [])
+        alt = engine_args({**cfg, "drafting": "mtp"}, exe, announce=False, lend=lend) + list(extra or [])
     except Exception:                                  # noqa: BLE001 - a retry that cannot be worked out is no retry
         return None
     return alt if alt != first + list(extra or []) else None
 
 
-def nodraft_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None) -> list[str] | None:
+def nodraft_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None, *, lend: bool = True) -> list[str] | None:
     """The arguments to start again with when an Auto start ends before the engine is ready because a card ran out of memory: the same start with no drafter
     (the draft layer and DFlash2's buffers are the biggest optional part on a card that is short), never the MTP in place of DFlash2.  None when the drafting
     was not Auto (the person named a drafter: that start fails with the engine's reason), when the first start has no drafter anyway, or when nothing differs."""
     if drafting.normalize(cfg.get("drafting")) != "auto" or "args" not in cfg:
         return None
     try:
-        first = engine_args(cfg, exe, announce=False)
+        first = engine_args(cfg, exe, announce=False, lend=lend)
         if "--draft" not in first and "--mtp" not in first:
             return None
-        alt = engine_args({**cfg, "drafting": "off"}, exe, announce=False) + list(extra or [])
+        alt = engine_args({**cfg, "drafting": "off"}, exe, announce=False, lend=lend) + list(extra or [])
     except Exception:                                  # noqa: BLE001 - a retry that cannot be worked out is no retry
         return None
     return alt if alt != first + list(extra or []) else None
 
 
-def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> list[str]:
+def vram_lend_asked(cfg: dict) -> bool:
+    """The config asks for VRAM Lend: "vram_lend": true, or --vram-lend in its args or user_args."""
+    args = list(cfg.get("args") or [])
+    if cfg.get("user_args"):
+        args = user_args.merge(args, cfg["user_args"])
+    return cfg.get("vram_lend") is True or "--vram-lend" in args
+
+
+def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True, lend: bool = True) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value). `exe` is the engine program that will start: the drafter's flags follow what that program takes
-    (strata_control/drafting.py engine_form). `announce=False` builds the arguments without the "[strata] drafting" lines
-    and without leaving a note for the next engine start (the retry arguments of mtp_retry_args)."""
+    (strata_control/drafting.py engine_form), and VRAM Lend's flag is dropped when it does not know it. `announce=False` builds the arguments without the "[strata] drafting" lines
+    and without leaving a note for the next engine start (the retry arguments of mtp_retry_args). lend=False: no
+    --vram-lend (a replica, see start_replicas)."""
     args = list(cfg["args"])
     # "user_args" (strata_control/user_args.py): the options the person set by hand, over the generated ones at every start,
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
@@ -3940,8 +3974,17 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
             args = [a for a in args if a != "--vram-lend"]
             print("[strata] VRAM Lend is not available on the Intel (SYCL) engine: starting without --vram-lend",
                   flush=True)
+    elif not lend:
+        args = [a for a in args if a != "--vram-lend"]
     elif cfg.get("vram_lend") is True and "--vram-lend" not in args:
         args.append("--vram-lend")
+    # an engine that does not know the flag (older than the server, or another model's engine) ends at the start on it:
+    # it starts without it, and the /vram routes answer as for an engine that cannot lend
+    if exe is not None and "--vram-lend" in args and not engine_knows(exe, cfg, "--vram-lend"):
+        args = [a for a in args if a != "--vram-lend"]
+        if announce:
+            print(f"[strata] this engine ({exe}) does not know --vram-lend (older than the server, or without VRAM Lend): "
+                  "starting without it, and the /vram routes lend nothing", flush=True)
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)
@@ -3955,10 +3998,7 @@ def vision_elastic_note(cfg: dict) -> str | None:
     reader (9f0794e9)."""
     if (cfg.get("vision") or {}).get("elastic") is not True:
         return None
-    args = list(cfg.get("args") or [])
-    if cfg.get("user_args"):
-        args = user_args.merge(args, cfg["user_args"])
-    if not sycl_engine(cfg) and (cfg.get("vram_lend") is True or "--vram-lend" in args):
+    if not sycl_engine(cfg) and vram_lend_asked(cfg):
         return ('[strata] the vision section\'s "elastic" is off with VRAM Lend ("vram_lend": true: other programs '
                 "borrow the expert cache's VRAM through its leases): the encoder starts with the model instead")
     return None
@@ -9715,19 +9755,25 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     arena, arena_note = rp.shared_arena_plan(cfg, n)         # opt-in: one copy of the experts in RAM for all replicas
     if arena_note:
         print(f"[strata] {arena_note}", flush=True)
+    # replicas do not lend (the /vram routes lend from one engine): no replica runs VRAM Lend's serial decode and
+    # segmented caches for nothing (the Intel engine says its own line)
+    if not sycl_engine(cfg) and any(vram_lend_asked(rp.replica_cfg(cfg, i, groups[i])) for i in range(n)):
+        print("[strata] VRAM Lend lends from one engine, not from replicas: the replicas start without --vram-lend, "
+              "and the /vram routes lend nothing", flush=True)
 
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
         if arena:
             rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
         try:
-            engines[i] = StrataEngine(exe, engine_args(rc, exe) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[i] = StrataEngine(exe, engine_args(rc, exe, lend=False) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None,
-                                      retry_args=mtp_retry_args(rc, exe, effort_end), retry_vram_args=nodraft_retry_args(rc, exe, effort_end))
+                                      retry_args=mtp_retry_args(rc, exe, effort_end, lend=False),
+                                      retry_vram_args=nodraft_retry_args(rc, exe, effort_end, lend=False))
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
-    warn_budget_over_ram(engine_args(rc0, announce=False) if "args" in rc0 else [])
+    warn_budget_over_ram(engine_args(rc0, announce=False, lend=False) if "args" in rc0 else [])
     if os.environ.get("STRATA_REPLICA_START", "") == "serial":
         for i in range(n):
             one(i)
