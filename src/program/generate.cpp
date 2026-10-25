@@ -16105,6 +16105,31 @@ int main(int argc, char** argv) {
                     }
                 }
                 int64_t piece = piece_now();
+                // VRAM Lend: a lend command that comes while the prompt is read waits for one chunk at most.  The first
+                // stage ends its run before its next chunk (Prefill::stop_at_chunk: the run returns once every stage has
+                // read the chunks before it, so nothing of the prompt path is in flight), the commands are answered, and
+                // the read goes on from there in the same chunks.  The loan stays as it is: the band a lease takes lies
+                // below every loan the prompt path can take, and the read sees the evicted experts as streamed ones.
+                if (piece <= 0 && lend_q != nullptr) {
+                    struct StopHook {
+                        std::function<bool()>& hook;
+                        ~StopHook() { hook = nullptr; }
+                    } stop_hook{sp.stop_at_chunk};
+                    sp.stop_at_chunk = [&] { return lend_q->waiting(); };
+                    for (int64_t q = a0; q < b0;) {
+                        if (!run(q, b0)) return false;
+                        if (sp.stopped_at() < 0) break;
+                        q += sp.stopped_at();
+                        const auto tl = Clock::now();
+                        serve_lends();
+                        std::fprintf(stderr, "strata serve: VRAM Lend: the prompt read stopped at token %lld of %lld, "
+                                             "%.0f ms into it, for a lend command (answered in %.1f ms); it goes on "
+                                             "from there\n", (long long) q, (long long) n,
+                                     std::chrono::duration<double, std::milli>(tl - pp_t0).count(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - tl).count());
+                    }
+                    return true;
+                }
                 if (piece <= 0) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
@@ -16388,6 +16413,8 @@ int main(int argc, char** argv) {
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
+                // VRAM Lend: a lend command that came during the segment's last chunk, before the next segment
+                if (lend_q != nullptr && lend_q->waiting()) serve_lends();
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
