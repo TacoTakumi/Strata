@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -25,9 +26,10 @@ from serve import gpu_map, runconfig, vram_lend  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# The stand-in engine: three GPU-PCI lines (GPU 2 does not lend), READY, then GEN (ids + 1000, one token every 30 ms,
-# on a thread: the command loop reads on meanwhile), STOP, QUIT and the lend commands with the engine's answers - only
-# when it was started with --vram-lend (without it, the generic ERR for a line it does not know).  GPUs lend in 64 MiB
+# The stand-in engine: three GPU-PCI lines (GPU 2 does not lend; only with --vram-lend, as the engine prints them),
+# READY, then GEN (ids + 1000, one token every 30 ms, on a thread: the command loop reads on meanwhile), STOP, QUIT and
+# the lend commands with the engine's answers - only when it was started with --vram-lend (without it, the generic ERR
+# for a line it does not know).  GPUs lend in 64 MiB
 # blocks (a lend is rounded up).  FAKE_LEND=0: an engine that refuses the lend commands as unknown; FAKE_BUSY=<n>: the
 # first n RETURNs answer ERR BUSY; FAKE_SLOW=<n>: the first n LENDs are answered 1.2 s late (the command loop waits,
 # as the engine's does while it reads a long prompt: the commands behind them wait too); FAKE_SLOW_RETURN=<n>: the
@@ -106,9 +108,10 @@ def lend_cmd(f):
     return [f"RETURNED {i}"]
 
 
-out("GPU-PCI dev=0 pci=0000:01:00.0")
-out("GPU-PCI dev=1 pci=0000:0A:00.0")
-out("GPU-PCI dev=2 pci=0000:0b:00.0")
+if flag:                                             # (the engine prints them only with --vram-lend)
+    out("GPU-PCI dev=0 pci=0000:01:00.0")
+    out("GPU-PCI dev=1 pci=0000:0A:00.0")
+    out("GPU-PCI dev=2 pci=0000:0b:00.0")
 out("READY 4096 stop")
 for line in sys.stdin:
     if log:
@@ -621,10 +624,43 @@ class Unsupported(LendBase):
                          [1001, 1002, 1003])
 
 
+# nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader as the rig answers it (numbered by PCI bus)
+SMI = ("0, 00000000:01:00.0\n1, 00000000:02:00.0\n2, 00000000:05:00.0\n3, 00000000:09:00.0\n"
+       "4, 00000000:0A:00.0\n")
+
+
+def fake_smi(test, text=SMI, missing=False) -> list:
+    """nvidia-smi answers `text` (missing: it is not installed) for the test's life, read afresh (nothing cached
+    from an earlier test); -> the list its calls go to."""
+    real, calls = subprocess.run, []
+
+    def run(cmd, *a, **k):
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "nvidia-smi":
+            calls.append(list(cmd))
+            if missing:
+                raise FileNotFoundError(2, "No such file or directory", "nvidia-smi")
+            return subprocess.CompletedProcess(cmd, 0, stdout=text, stderr="")
+        return real(cmd, *a, **k)
+    for p in (mock.patch("subprocess.run", run), mock.patch.object(gpu_map, "_smi", None, create=True)):
+        p.start()
+        test.addCleanup(p.stop)
+    return calls
+
+
+# the run's cards in the engine's order (its GPU 0 first): the 4060 Ti on 0a:00.0, then the 3090 on 01:00.0
+RUN = [{"gpu": "0000:0a:00.0", "lendable": 0, "lent": 0}, {"gpu": "0000:01:00.0", "lendable": 0, "lent": 0}]
+
+
 class OptionOff(LendBase):
     """Without --vram-lend (the config's "vram_lend" not true): every lend and return answers 501, /vram/state lists
-    the GPUs with 0 and 0, and nothing goes to the engine."""
+    the run's GPUs with 0 and 0, and nothing goes to the engine.  The engine prints no GPU-PCI lines then: the server
+    reads the cards' addresses from nvidia-smi, in the engine's card order."""
     args: list = []
+
+    def setUp(self):
+        super().setUp()
+        self.smi = fake_smi(self)
+        self.svc.engine_gpus = [4, 0]
 
     def test_501_and_0_0(self):
         self.assertFalse(self.engine.lending)
@@ -633,10 +669,10 @@ class OptionOff(LendBase):
         self.assertIsInstance(out["error"], str)
         self.assertEqual(self.give_back("7")[0], 501)
         self.assertEqual(self.give_back(7)[0], 501)
-        self.assertEqual(self.state(), {"gpus": [{"gpu": "0000:01:00.0", "lendable": 0, "lent": 0},
-                                                 {"gpu": "0000:0a:00.0", "lendable": 0, "lent": 0},
-                                                 {"gpu": "0000:0b:00.0", "lendable": 0, "lent": 0}],
-                                        "leases": []})
+        self.assertEqual(self.engine.lend_gpus, [])
+        self.assertEqual(self.state(), {"gpus": RUN, "leases": []})
+        self.assertEqual(self.state(), {"gpus": RUN, "leases": []})
+        self.assertEqual(self.smi, [["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"]])  # once
         self.assertEqual(self.lend_lines(), [])
         ids = [1, 2, 3]
         self.assertEqual([t for t in self.engine.generate(ids, 3, {}, threading.Event()) if t is not None],
@@ -648,6 +684,65 @@ class OptionOff(LendBase):
         self.engine.proc.stdin.flush()
         line = self.engine.lines.get(timeout=10)
         self.assertTrue(line.startswith("ERR expected"), line)
+
+    def test_engine_not_running(self):
+        # an idle unload (or before the first load): the run's GPUs, each 0 and 0
+        self.engine.close()
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.state(), {"gpus": RUN, "leases": []})
+
+    def test_a_card_nvidia_smi_does_not_list_is_left_out(self):
+        self.svc.engine_gpus = [4, 7, 0]
+        self.assertEqual(self.state(), {"gpus": RUN, "leases": []})
+
+    def test_odd_nvidia_smi_lines_are_skipped(self):
+        self.smi = fake_smi(self, "0, 00000000:01:00.0\nNo devices were found\n4, -\n, 0a:00.0\n\n4, 0A:00.0\n")
+        self.assertEqual(self.state(), {"gpus": RUN, "leases": []})
+
+
+class OptionOffNoAddresses(LendBase):
+    """Without --vram-lend and with no way to read the cards' addresses: no GPUs, as for an engine that reports none,
+    and no error."""
+    args: list = []
+
+    def test_no_nvidia_smi(self):
+        smi = fake_smi(self, missing=True)
+        self.svc.engine_gpus = [4, 0]
+        self.assertEqual(self.state(), {"gpus": [], "leases": []})
+        self.assertEqual(self.state(), {"gpus": [], "leases": []})
+        self.assertEqual(len(smi), 1)                 # (not asked again)
+
+    def test_nvidia_smi_fails(self):
+        def run(cmd, *a, **k):
+            raise subprocess.TimeoutExpired(cmd, 10)
+        self.svc.engine_gpus = [4, 0]
+        with mock.patch.object(gpu_map, "_smi", None, create=True), mock.patch("subprocess.run", run):
+            self.assertEqual(self.state(), {"gpus": [], "leases": []})
+        smi = fake_smi(self)                          # (a timeout is not kept: the next state asks again)
+        self.assertEqual(self.state(), {"gpus": RUN, "leases": []})
+        self.assertEqual(len(smi), 1)
+
+    def test_amd_backend_and_cpu_run(self):
+        smi = fake_smi(self)
+        self.svc.backend, self.svc.engine_gpus = "hip", [4, 0]      # (HIP numbers its cards itself)
+        self.assertEqual(self.state(), {"gpus": [], "leases": []})
+        self.svc.backend, self.svc.engine_gpus = None, []           # a CPU run: no cards
+        self.assertEqual(self.state(), {"gpus": [], "leases": []})
+        self.assertEqual(smi, [])
+
+
+class OptionOnLinesWin(LendBase):
+    """With --vram-lend the engine's GPU-PCI lines name the GPUs, also once the engine has stopped: nvidia-smi is not
+    asked."""
+
+    def test_lines_win(self):
+        smi = fake_smi(self)
+        self.svc.engine_gpus = [4, 0]
+        want = ["0000:01:00.0", "0000:0a:00.0", "0000:0b:00.0"]
+        self.assertEqual([g["gpu"] for g in self.state()["gpus"]], want)
+        self.engine.close()
+        self.assertEqual(self.state(), {"gpus": [{"gpu": a, "lendable": 0, "lent": 0} for a in want], "leases": []})
+        self.assertEqual(smi, [])
 
 
 class NoLendingEngine(unittest.TestCase):
@@ -747,6 +842,11 @@ class Addresses(unittest.TestCase):
         for line in ("GPU-PCI pci=0000:01:00.0", "GPU floor pre+post+head 1.00 ms per token",
                      "VRAM reserve_mib=700 gpu=0", "INFO dev=0 pci=0000:01:00.0", ""):
             self.assertIsNone(gpu_map.parse(line), line)
+
+    def test_nvidia_smi_addresses(self):
+        fake_smi(self)
+        self.assertEqual(gpu_map.nvidia_smi(), {0: "0000:01:00.0", 1: "0000:02:00.0", 2: "0000:05:00.0",
+                                                3: "0000:09:00.0", 4: "0000:0a:00.0"})
 
 
 class ConfigKey(unittest.TestCase):

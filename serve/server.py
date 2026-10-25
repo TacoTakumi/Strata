@@ -4041,7 +4041,7 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
-        self.vram_lend = vram_lend.Lender()           # the /vram routes (VRAM Lend: the engine's GPU memory lent out)
+        self.vram_lend = vram_lend.Lender(self.lend_cards)   # the /vram routes (VRAM Lend: GPU memory lent out)
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4482,6 +4482,16 @@ class Service:
         cards = (getattr(self, "engine_gpus", None) or (groups[0] if groups else None)
                  or getattr(self, "gpu_indices", None) or [0])
         return [int(i) for i in cards]
+
+    def lend_cards(self) -> list[tuple[int, str]]:
+        """VRAM Lend: (engine GPU number, PCI address) of the engine's cards in its own order, the addresses from
+        nvidia-smi - what GET /vram/state lists, each 0 and 0, when the engine printed no GPU-PCI lines (started without
+        --vram-lend, or not running).  [] for a run without NVIDIA cards (CPU, the AMD backend, the mock engine) or
+        without nvidia-smi; a card nvidia-smi does not list is left out."""
+        if getattr(self, "backend", None) not in (None, "cuda") or not getattr(self, "engine_gpus", None):
+            return []
+        smi = gpu_map.nvidia_smi()
+        return [(d, smi[c]) for d, c in enumerate(self.engine_cards()) if c in smi]
 
     def gpu_label(self, device: int | None) -> int:
         """#533: the engine's GPU number (0 = the main card, the --split-device numbering) -> the nvidia-smi number
