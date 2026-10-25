@@ -3126,6 +3126,35 @@ def sycl_engine(cfg: dict) -> bool:
     return cfg.get("backend") == "sycl" or (isinstance(exe, str) and Path(exe).name == "strata-sycl.sh")
 
 
+_ENGINE_KNOWS: dict = {}
+
+
+def engine_knows(exe: str, cfg: dict | None, flag: str) -> bool:
+    """The engine names `flag` (its usage text is in the binary): an engine older than the server, or another model's
+    engine, ends at the start on an option it does not know.  Read once per binary (its path, size and time) and
+    flag; False when the file cannot be read."""
+    path = engine_binary(exe, cfg)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    key = (os.path.abspath(path), st.st_size, st.st_mtime_ns, flag)
+    if key not in _ENGINE_KNOWS:
+        want, tail, found = flag.encode(), b"", False
+        try:
+            with open(path, "rb") as f:
+                while not found:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    found = want in tail + chunk
+                    tail = chunk[1 - len(want):] if len(want) > 1 else b""
+        except OSError:
+            return False
+        _ENGINE_KNOWS[key] = found
+    return _ENGINE_KNOWS[key]
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -3136,11 +3165,7 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
     if pos == "start":
         return None
-    try:
-        with open(engine_binary(exe, cfg), "rb") as f:
-            known = b"--tail-role-token" in f.read()
-    except OSError:
-        known = False
+    known = engine_knows(exe, cfg, "--tail-role-token")
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
         print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
@@ -3229,10 +3254,19 @@ def drafting_card_class() -> str:
     return _CARD_CLASS[0]
 
 
-def engine_args(cfg: dict) -> list[str]:
+def vram_lend_asked(cfg: dict) -> bool:
+    """The config asks for VRAM Lend: "vram_lend": true, or --vram-lend in its args or user_args."""
+    args = list(cfg.get("args") or [])
+    if cfg.get("user_args"):
+        args = user_args.merge(args, cfg["user_args"])
+    return cfg.get("vram_lend") is True or "--vram-lend" in args
+
+
+def engine_args(cfg: dict, exe: str | None = None, *, lend: bool = True) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
-    layer_split_value)."""
+    layer_split_value).  `exe`: the engine that starts with them, read for the flags it knows (VRAM Lend's);
+    lend=False: no --vram-lend (a replica, see start_replicas)."""
     args = list(cfg["args"])
     # "user_args" (strata_control/user_args.py): the options the person set by hand, over the generated ones at every start,
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
@@ -3287,8 +3321,16 @@ def engine_args(cfg: dict) -> list[str]:
             args = [a for a in args if a != "--vram-lend"]
             print("[strata] VRAM Lend is not available on the Intel (SYCL) engine: starting without --vram-lend",
                   flush=True)
+    elif not lend:
+        args = [a for a in args if a != "--vram-lend"]
     elif cfg.get("vram_lend") is True and "--vram-lend" not in args:
         args.append("--vram-lend")
+    # an engine that does not know the flag (older than the server, or another model's engine) ends at the start on it:
+    # it starts without it, and the /vram routes answer as for an engine that cannot lend
+    if exe is not None and "--vram-lend" in args and not engine_knows(exe, cfg, "--vram-lend"):
+        args = [a for a in args if a != "--vram-lend"]
+        print(f"[strata] this engine ({exe}) does not know --vram-lend (older than the server, or without VRAM Lend): "
+              "starting without it, and the /vram routes lend nothing", flush=True)
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)
@@ -3301,10 +3343,7 @@ def vision_elastic_note(cfg: dict) -> str | None:
     without VRAM Lend, see engine_args)."""
     if (cfg.get("vision") or {}).get("elastic") is not True:
         return None
-    args = list(cfg.get("args") or [])
-    if cfg.get("user_args"):
-        args = user_args.merge(args, cfg["user_args"])
-    if not sycl_engine(cfg) and (cfg.get("vram_lend") is True or "--vram-lend" in args):
+    if not sycl_engine(cfg) and vram_lend_asked(cfg):
         return ('[strata] the vision section\'s "elastic" is off with VRAM Lend ("vram_lend": true: other programs '
                 "borrow the expert cache's VRAM through its leases): the encoder starts with the model instead")
     if cfg.get("vram_elastic") is not True:
@@ -8638,16 +8677,21 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
           flush=True)
     engines: list = [None] * n
     errors: list = []
+    # replicas do not lend (the /vram routes lend from one engine): no replica runs VRAM Lend's serial decode and
+    # segmented caches for nothing (the Intel engine says its own line)
+    if not sycl_engine(cfg) and any(vram_lend_asked(rp.replica_cfg(cfg, i, groups[i])) for i in range(n)):
+        print("[strata] VRAM Lend lends from one engine, not from replicas: the replicas start without --vram-lend, "
+              "and the /vram routes lend nothing", flush=True)
 
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
-            engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[i] = StrataEngine(exe, engine_args(rc, lend=False) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None)
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
-    warn_budget_over_ram(engine_args(rc0) if "args" in rc0 else [])
+    warn_budget_over_ram(engine_args(rc0, lend=False) if "args" in rc0 else [])
     if os.environ.get("STRATA_REPLICA_START", "") == "serial":
         for i in range(n):
             one(i)
@@ -9135,7 +9179,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         elif split:
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+            engine = StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))

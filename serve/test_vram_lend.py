@@ -149,9 +149,16 @@ for line in sys.stdin:
 '''
 
 
-def stand_in(d: Path) -> str:
+# An engine that does not know --vram-lend (an engine older than the server, or another model's engine such as the
+# DeepSeek-V4.1 one): the flag is nowhere in its file (its usage text does not name it), and it ends at the start
+# with "unknown option" (exit 2) when given it
+OLD_STAND_IN = ('import sys\nif "--vram-" + "lend" in sys.argv:\n    sys.stderr.write("unknown option\\n")\n'
+                '    sys.exit(2)\n' + STAND_IN.replace("--vram-lend", "--no-such-option"))
+
+
+def stand_in(d: Path, text: str = STAND_IN) -> str:
     exe = d / "engine"
-    exe.write_text(f"#!{sys.executable}\n" + STAND_IN)
+    exe.write_text(f"#!{sys.executable}\n" + text)
     exe.chmod(0o755)
     return str(exe)
 
@@ -168,11 +175,18 @@ class LendBase(unittest.TestCase):
         d = Path(self.dir.name)
         self.log = d / "lines.log"
         env = dict(os.environ, FAKE_LOG=str(self.log), **self.env)
-        self.engine = StrataEngine(stand_in(d), list(self.args), env=env)
+        exe = self.make_exe(d)
+        self.engine = StrataEngine(exe, self.start_args(exe), env=env)
         tok = ByteTokenizer()
         self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def make_exe(self, d: Path) -> str:
+        return stand_in(d)
+
+    def start_args(self, exe: str) -> list:
+        return list(self.args)
 
     def tearDown(self):
         self.httpd.shutdown()
@@ -766,6 +780,83 @@ class IntelEngine(LendBase):
         self.assertEqual((smi, self.lend_lines()), ([], []))
         self.assertEqual([t for t in self.engine.generate([1, 2], 2, {}, threading.Event()) if t is not None],
                          [1001, 1002])
+
+
+class OlderEngine(OptionOff):
+    """An engine that does not know --vram-lend, with "vram_lend": true: the server reads the engine's file for the
+    flag, starts it without the flag with one line why, and the /vram routes answer as for an engine that cannot lend
+    (501, the run's GPUs with 0 and 0)."""
+    CFG = {"args": ["--max-context", "8192"], "vram_lend": True}
+
+    def make_exe(self, d: Path) -> str:
+        return stand_in(d, OLD_STAND_IN)
+
+    def start_args(self, exe: str) -> list:
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.started = engine_args(self.CFG, exe)
+        self.said = [x for x in out.getvalue().splitlines() if "--vram-lend" in x]
+        return self.started
+
+    def test_starts_without_the_flag(self):
+        self.assertEqual(self.started, ["--max-context", "8192"])
+        self.assertEqual(len(self.said), 1, self.said)
+        self.assertTrue(self.engine.alive())
+        self.assertEqual(self.engine.spawn[1], ["--max-context", "8192"])
+
+    def test_the_flag_in_the_args_is_left_out_too(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            got = engine_args({"args": ["--max-context", "8192", "--vram-lend"]}, self.engine.spawn[0])
+        self.assertEqual(got, ["--max-context", "8192"])
+        self.assertEqual(len([x for x in out.getvalue().splitlines() if "--vram-lend" in x]), 1)
+
+
+class EngineThatLends(unittest.TestCase):
+    """A single NVIDIA engine whose file names --vram-lend gets the flag, and nothing is said."""
+
+    def test_the_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = stand_in(Path(d))
+            for cfg in ({"args": ["--max-context", "8192"], "vram_lend": True},
+                        {"args": ["--max-context", "8192"], "vram_lend": True, "backend": "cuda", "gpu": 0}):
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    self.assertEqual(engine_args(cfg, exe), ["--max-context", "8192", "--vram-lend"])
+                self.assertNotIn("vram-lend", out.getvalue())
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:      # option off: nothing added or said
+                self.assertEqual(engine_args({"args": ["--max-context", "8192"]}, exe), ["--max-context", "8192"])
+            self.assertEqual(out.getvalue(), "")
+
+
+class Replicas(unittest.TestCase):
+    """Replicas do not lend (the /vram routes lend from one engine): with "vram_lend": true every replica starts
+    without --vram-lend, so none runs VRAM Lend's serial decode and segmented caches for nothing, and one line says
+    so."""
+
+    def start(self, cfg):
+        from serve import server
+        started = []
+
+        class Engine:
+            def __init__(self, exe, args, **kw):
+                started.append(list(args))
+
+        with mock.patch.object(server, "StrataEngine", Engine), \
+                mock.patch.dict(os.environ, {"STRATA_REPLICA_START": "serial"}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            server.start_replicas(cfg, [[0], [1]], "/nonexistent/strata", [], False)
+        return started, [x for x in out.getvalue().splitlines() if "--vram-lend" in x]
+
+    def test_no_replica_gets_the_flag(self):
+        base = {"args": ["--max-context", "8192"], "gpu": [0, 1], "replicas": 2, "replica_cpus": False}
+        for cfg in ({**base, "vram_lend": True}, {**base, "args": ["--max-context", "8192", "--vram-lend"]},
+                    {**base, "replicas": [{"gpus": [0], "args": ["--vram-lend"]}, {"gpus": [1]}]}):
+            started, said = self.start(cfg)
+            self.assertEqual(len(started), 2, cfg)
+            for args in started:
+                self.assertNotIn("--vram-lend", args, cfg)
+            self.assertEqual(len(said), 1, (cfg, said))
+            self.assertIn("replica", said[0])
+        started, said = self.start(base)                                     # option off: nothing said
+        self.assertEqual((started, said), ([["--max-context", "8192"]] * 2, []))
 
 
 class NoLendingEngine(unittest.TestCase):
