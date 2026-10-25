@@ -18,6 +18,8 @@ using strata::core::LendCommands;
 using strata::core::LendLineKind;
 using strata::core::LendQueue;
 using strata::core::LendTaken;
+using strata::core::SegmentLendCache;
+using strata::core::lend_band;
 using strata::core::lend_line_kind;
 using strata::core::lendable_bytes;
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
@@ -93,6 +95,25 @@ uint64_t lent_id(const std::string& reply, int dev, size_t mib) {
     if (reply != "LENT " + std::to_string(id) + " " + std::to_string(d) + " " + std::to_string(m) + "\n") return 0;
     return d == dev && m == mib ? (uint64_t) id : 0;
 }
+
+// A segmented expert cache as SegmentLendCache sees it: `n` live slots of `stride` bytes each, back to back, in
+// segments of `seg` bytes (the last one shorter), each mapped or not.
+struct FakeSegCache {
+    int64_t n = 0;
+    uint64_t stride = 0;
+    int64_t seg = 0;   // 0: not segmented
+    std::vector<bool> mapped;
+
+    FakeSegCache(int64_t slots, uint64_t slot_bytes, int64_t seg_bytes) : n(slots), stride(slot_bytes), seg(seg_bytes) {
+        if (seg > 0) mapped.assign((size_t) ((n * stride + seg - 1) / seg), true);
+    }
+    bool segmented() const { return seg > 0; }
+    int64_t segment_bytes() const { return seg; }
+    int64_t segments() const { return (int64_t) mapped.size(); }
+    bool segment_mapped(int64_t i) const { return i >= 0 && i < segments() && mapped[(size_t) i]; }
+    int64_t slots() const { return n; }
+    uint64_t slot_offset(int64_t s) const { return (uint64_t) s * stride; }
+};
 
 }  // namespace
 
@@ -307,6 +328,69 @@ int main() {
         }
         reader.join();
         CHECK(next == kN && !tq.waiting());
+    }
+
+    // ---- the lend band: the whole segments between the floor's end and the prompt loan's start (byte offsets)
+    CHECK(lend_band(0, 1024 * M, 512 * M).first == 0 && lend_band(0, 1024 * M, 512 * M).end == 2);
+    CHECK(lend_band(1, 1024 * M, 512 * M).first == 1 && lend_band(1, 1024 * M, 512 * M).segments() == 1);
+    CHECK(lend_band(512 * M, 1024 * M - 1, 512 * M).segments() == 0);   // the loan starts inside segment 1
+    CHECK(lend_band(300 * M, 1600 * M, 512 * M).first == 1 && lend_band(300 * M, 1600 * M, 512 * M).end == 3);
+    CHECK(lend_band(1100 * M, 1000 * M, 512 * M).segments() == 0);      // the edges cross: nothing
+    CHECK(lend_band(0, 1024 * M, 0).segments() == 0);                   // not segmented: nothing
+
+    // ---- SegmentLendCache over the served layout's shape: 7551 slots of ~2.5 MiB, 512 MiB segments, the 128-slot
+    // floor and a 1766-slot prompt loan
+    {
+        const uint64_t stride = 2600000;
+        FakeSegCache c0(7551, stride, 512 * (int64_t) M), c1(6936, stride, 512 * (int64_t) M), flat(4000, stride, 0);
+        SegmentLendCache<FakeSegCache> lc;
+        const auto k0 = lc.add(0, c0, 128, 1766);   // (a copy: the next add moves the cards)
+        CHECK(k0.band.first == 1);                                   // slot 127 ends inside segment 0
+        CHECK(k0.band.end == (int64_t) ((7551 - 1766) * stride / (512 * M)));
+        // within one segment of the rule: pool - prompt borrow - floor, in whole segments
+        const size_t rule0 = lendable_bytes(7551 * stride, 1766 * stride, 128 * stride, 512 * M);
+        const size_t band0 = (size_t) k0.band.segments() * 512 * M;
+        CHECK(band0 <= rule0 && rule0 - band0 <= 512 * M);
+        lc.add(1, c1, 128, 1766);
+        lc.add(3, flat, 128, 1766);                                  // not segmented: listed, lends nothing
+        std::vector<LendCard> v = lc.lend_cards();
+        CHECK(v.size() == 3 && v[0].dev == 0 && v[1].dev == 1 && v[2].dev == 3);
+        CHECK(v[0].block_bytes == 512 * M && v[0].lendable_bytes == band0);
+        CHECK(v[1].lendable_bytes == (size_t) lc.cards()[1].band.segments() * 512 * M && v[1].lendable_bytes > 0);
+        CHECK(v[2].block_bytes == 0 && v[2].lendable_bytes == 0);
+        // the band's segments that are not mapped are not lendable; segments outside the band never count
+        c0.mapped[(size_t) k0.band.first] = false;
+        c0.mapped[(size_t) k0.band.first + 4] = false;
+        c0.mapped[0] = false;
+        c0.mapped[(size_t) k0.band.end] = false;
+        CHECK(lc.lend_cards()[0].lendable_bytes == band0 - 2 * 512 * M);
+        c0.mapped.assign(c0.mapped.size(), true);
+        // fewer live slots (a shrink of the tail): the loan moves down and the band's end with it
+        c0.n = 6000;
+        CHECK(lc.lend_cards()[0].lendable_bytes ==
+              (size_t) ((int64_t) ((6000 - 1766) * stride / (512 * M)) - k0.band.first) * 512 * M);
+        c0.n = 7551;
+        CHECK(lc.lend_cards()[0].lendable_bytes == band0);
+        // no loan: the band reaches the last whole segment of the live slots; a loan of every slot: no band
+        FakeSegCache c2(7551, stride, 512 * (int64_t) M);
+        SegmentLendCache<FakeSegCache> lc2;
+        CHECK(lc2.add(0, c2, 128, 0).band.end == (int64_t) (7551 * stride / (512 * M)));
+        CHECK(lc2.add(1, c2, 128, 7551).band.segments() == 0);
+        CHECK(lc2.add(2, c2, 8000, 0).band.segments() == 0);
+
+        // LENDABLE through the lend commands; a LEND is refused with nothing lendable now (leases are not taken yet)
+        LendCommands d(lc);
+        const std::string want = "LENDABLE dev=0 lendable=" + std::to_string(band0 / M) + " lent=0\n" +
+                                 "LENDABLE dev=1 lendable=" + std::to_string(v[1].lendable_bytes / M) + " lent=0\n" +
+                                 "LENDABLE dev=3 lendable=0 lent=0\nEND\n";
+        CHECK_REPLY(d, "LENDABLE", want);
+        CHECK_REPLY(d, "LEND 0 512", "ERR MAX 0\n");
+        CHECK_REPLY(d, "LEND 0 99999999", "ERR MAX " + std::to_string(band0 / M) + "\n");
+        CHECK_REPLY(d, "LEND 3 1", "ERR MAX 0\n");
+        CHECK_REPLY(d, "LEND 2 1", "ERR NODEV 2\n");
+        CHECK_REPLY(d, "RETURN 1", "ERR UNKNOWN 1\n");
+        CHECK(d.open_leases() == 0);
+        CHECK_REPLY(d, "LENDABLE", want);
     }
 
     std::printf("vram_lend_test: all checks passed\n");

@@ -26,6 +26,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_nibble.hpp"
+#include "strata/core/vram_lend.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
@@ -12014,8 +12015,14 @@ int main(int argc, char** argv) {
             std::condition_variable cv;
             std::deque<std::string> lines;
             bool eof = false;
+            // VRAM Lend: LEND, RETURN and LENDABLE wait in a queue of their own (vram_lend.hpp), never in `lines`, so a
+            // request that is decoding sees them at its next window end as it sees a STOP; the main thread answers them
+            bool lend_on = false;
+            strata::core::LendQueue lend;
         };
         const auto in_shared = std::make_shared<StdinShared>();
+        in_shared->lend_on = o.vram_lend;   // (before the reader starts)
+        strata::core::LendQueue* const lend_q = o.vram_lend ? &in_shared->lend : nullptr;   // null: no lending
         std::atomic<bool>& stop_req = in_shared->stop_req;
         std::mutex& in_mu = in_shared->mu;
         std::condition_variable& in_cv = in_shared->cv;
@@ -12054,6 +12061,11 @@ int main(int argc, char** argv) {
             };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
+                if (st->lend_on && st->lend.route(l)) {   // (the wake-up under mu: next_line's wait cannot miss it)
+                    std::lock_guard<std::mutex> lk(st->mu);
+                    st->cv.notify_one();
+                    continue;
+                }
                 if (l == "STOP") { st->stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(st->mu);
                 st->lines.push_back(l);
@@ -12063,9 +12075,11 @@ int main(int argc, char** argv) {
             st->eof = true;
             st->cv.notify_one();
         }).detach();
+        // the next line, waiting for one: a waiting lend command first (idle: the command loop answers it at once)
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof || (lend_q != nullptr && lend_q->waiting()); });
+            if (lend_q != nullptr && lend_q->take(out)) return true;
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
@@ -12219,6 +12233,10 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
         }
+        // VRAM Lend: what each card can lend, and the lend commands with their leases, for the engine's life (null:
+        // started without --vram-lend)
+        std::unique_ptr<strata::core::SegmentLendCache<strata::core::ExpertCache>> lend_cache;
+        std::unique_ptr<strata::core::LendCommands> lends;
 #if !defined(STRATA_USE_HIP)
         // VRAM Lend: one line per GPU that holds an expert cache, the main card first, then the stages: the engine's
         // GPU number (as the VRAM command's: 0 is the main card, a later stage its CUDA number) and the PCI address
@@ -12241,8 +12259,58 @@ int main(int argc, char** argv) {
             for (const auto& st : stages) gpu_line(st->dev, st->dev, st->cache);
             std::fprintf(stderr, "strata generate: VRAM Lend: expert caches in segments of %lld MiB: %s\n",
                          (long long) o.vram_segment_mib, segs.c_str());
+            // Each card lends whole segments from one band: above the 128-slot floor every loan leaves, below the
+            // largest region the prompt path's loan can take from the tail - over every chunk a request can read in,
+            // not only the start's (#2090: a smaller chunk can need more slots) - so a prompt read with all of it lent
+            // still borrows its full loan, and the loan never meets a lent segment.  Fixed here, once.
+            constexpr int64_t kLendFloorSlots = 128;
+            auto loan_slots = [&](const strata::core::ExpertCache& c) -> int64_t {
+                const PfPart* p = nullptr;
+                for (const PfPart& q : pf_parts)
+                    if (q.cache == &c) p = &q;
+                if (p == nullptr || p->first < 0) return 0;   // its prompt path keeps its own buffers: no loan here
+                const int64_t n = c.slots();
+                int64_t k = n - p->first;
+                if (o.prefill_head_alias) return k;          // the loan laid out at start is kept
+                for (int64_t t = 256; t < o.prefill_chunk + 256; t += 256) {   // the chunks `lend` can choose
+                    const int64_t kt = part_slots(*p, std::min(t, o.prefill_chunk));
+                    if (kt > 0 && kt + kLendFloorSlots <= n) k = std::max(k, kt);
+                }
+                return k;
+            };
+            lend_cache = std::make_unique<strata::core::SegmentLendCache<strata::core::ExpertCache>>();
+            auto lend_card = [&](int dev, const strata::core::ExpertCache& c) {
+                const auto& k = lend_cache->add(dev, c, kLendFloorSlots, loan_slots(c));
+                const double mib = 1048576.0;
+                const int64_t at = k.loan_slots > 0 ? c.slots() - k.loan_slots : c.slots();
+                const double pool = (double) c.bytes() / mib, floor_end = (double) c.bytes_of(kLendFloorSlots) / mib;
+                const double borrow = (double) (c.bytes() - c.bytes_of(at)) / mib;
+                std::fprintf(stderr, "strata generate: VRAM Lend: GPU %d lends from segments [%lld, %lld) of %lld: %lld "
+                                     "segments, %lld MiB (pool %.0f - prompt borrow %.0f - floor %.0f = %.0f MiB): the "
+                                     "%lld-slot floor ends at %.0f MiB, the prompt path's largest loan is %lld slots from "
+                                     "slot %lld of %lld\n",
+                             dev, (long long) k.band.first, (long long) k.band.end, (long long) c.segments(),
+                             (long long) k.band.segments(), (long long) (k.band.segments() * c.segment_bytes() >> 20),
+                             pool, borrow, floor_end, std::max(0.0, pool - borrow - floor_end),
+                             (long long) kLendFloorSlots, floor_end, (long long) k.loan_slots, (long long) at,
+                             (long long) c.slots());
+            };
+            lend_card(0, xcache);
+            for (const auto& st : stages) lend_card(st->dev, st->cache);
+            lends = std::make_unique<strata::core::LendCommands>(*lend_cache);
         }
 #endif
+        // a lend command's answer: whole lines from the main thread between two steps, never inside a request's lines
+        auto lend_reply = [&](const std::string& l) {
+            std::string reply;
+            if (lends != nullptr) lends->handle(l, reply);
+            std::fputs(reply.c_str(), stdout);
+            std::fflush(stdout);
+        };
+        // every waiting lend command, in the order they came: when idle, and at the end of each decode window
+        auto serve_lends = [&] {
+            for (std::string l; lend_q != nullptr && lend_q->take(l);) lend_reply(l);
+        };
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
@@ -13528,6 +13596,10 @@ int main(int argc, char** argv) {
                 }
             } else if (!next_line(line)) {
                 break;
+            }
+            if (lend_q != nullptr && strata::core::lend_line_kind(line) != strata::core::LendLineKind::none) {
+                lend_reply(line);   // (idle: next_line takes a waiting lend command first)
+                continue;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
@@ -16980,6 +17052,9 @@ int main(int argc, char** argv) {
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
+                // VRAM Lend: the lend commands that came during the window, at its end - its tokens are out, the
+                // draft for the next one ran and the adaptive tier joined (one atomic load when none waits)
+                if (lend_q != nullptr && lend_q->waiting()) serve_lends();
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
