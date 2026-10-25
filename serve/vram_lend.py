@@ -21,13 +21,14 @@ into JSON, as VRAM Lend's api.md and engine-protocol.md specify:
 Every lend and return route answers 501 {"error": ...} for an engine that cannot lend (started without --vram-lend, it
 refuses the commands, or it is not a Strata engine), 502 for an answer the server does not know, and 503 {"error": ...}
 when the engine is not running or did not answer; /vram/state then lists the engine's GPUs with lendable and lent 0 (no
-GPUs at all for an engine that reports none).  The engine takes the commands between its steps, and one step can read a
+GPUs at all for an engine that reports none and a server that cannot read them itself).  The engine takes the commands between its steps, and one step can read a
 long prompt: a LEND it answers after the route stopped waiting (Lender.answer_s, 30 s) still lends, and the server gives
 that lease back by itself - /vram/state lists it until the engine has it back.
 
 A GPU is named by its PCI address, matched whatever its case or spelling (gpu_map.pci_addr: CUDA's, NVML's 8-digit
 domain, lspci's without one) and answered as "0000:0a:00.0" - lower case, a 4-digit domain and the function, as lspci
-and sysfs spell it.  The engine's GPU-PCI lines give each GPU's number.  A lease id is opaque (a string; the engine
+and sysfs spell it.  The engine's GPU-PCI lines give each GPU's number.  Without them (an engine started without
+--vram-lend prints none) /vram/state lists the run's cards from Lender's `cards` instead.  A lease id is opaque (a string; the engine
 hands out decimal numbers, from 1 again in each process: the server adds what earlier processes handed out, so an id
 names one lease for the server's life).
 
@@ -155,7 +156,9 @@ class NoLending(Exception):
 class Lender:
     """The /vram routes over the service's engine (one for the server's life; the engine may restart under it)."""
 
-    def __init__(self):
+    def __init__(self, cards=None):
+        # () -> [(engine GPU number, PCI address)] of the run's cards in the engine's order, when the engine names none
+        self._cards = cards
         self._lock = threading.Lock()     # the record: held to read or change it, never while the engine answers
         self._owner = None                # the engine process the record belongs to
         self._leases: dict[str, dict] = {}   # id -> {"id", "gpu", "mib"}, in the order they were lent
@@ -378,8 +381,16 @@ class Lender:
             return 400, {"error": f"the engine refused the return: {got[0]}"}
         return 502, {"error": f"the engine answered {got[0]!r}"}
 
+    def _run_cards(self) -> list[tuple[int, str]]:
+        """The run's cards as the server finds them (the cards callable), for an engine that named no GPUs."""
+        try:
+            got = self._cards() if self._cards is not None else []
+        except Exception:  # noqa: BLE001 - /vram/state answers whatever the lookup does
+            return []
+        return [(d, a) for d, a in got or [] if isinstance(d, int) and isinstance(a, str)]
+
     def state(self, engine) -> tuple[int, dict]:
-        gpus = self._gpus(engine)
+        gpus = self._gpus(engine) or self._run_cards()
         idle = {"gpus": [{"gpu": a, "lendable": 0, "lent": 0} for _, a in gpus], "leases": []}
         if not self._enabled(engine):
             return 200, idle
