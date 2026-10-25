@@ -30,13 +30,16 @@
 // The commands come while requests run.  The engine's stdin reader thread passes each line through a LendQueue, and
 // the engine's command loop takes them on its own thread: LENDABLE at any line, LEND and RETURN where nothing is in
 // flight.
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -106,20 +109,31 @@ struct LendBand {
     std::int64_t first = 0, end = 0;
     std::int64_t segments() const { return end > first ? end - first : 0; }
 };
+
+/// A lease on one card's cache: the segments it took (in segment order) and what the engine took out of its tables
+/// for them - (residency row, slot) of every expert evicted, so a return can put each one back in its slot.
+struct SegmentLease {
+    int dev = 0;
+    std::vector<std::int64_t> segs;
+    std::vector<std::pair<std::int32_t, std::int32_t>> evicted;
+};
 inline LendBand lend_band(std::uint64_t floor_end, std::uint64_t loan_start, std::uint64_t seg_bytes) {
     if (seg_bytes == 0) return {};
     return {(std::int64_t) ((floor_end + seg_bytes - 1) / seg_bytes), (std::int64_t) (loan_start / seg_bytes)};
 }
 
 /// LendCache over segmented expert caches, one per card (a layer split has one per stage); a segment is the lend
-/// block.  `Cache` gives the segment layout: segmented(), segment_bytes(), segments(), segment_mapped(i), slots() and
-/// slot_offset(s) (strata::core::ExpertCache).  A card's band is fixed when it is added, from the slots its floor keeps
+/// block.  `Cache` gives the segment layout: segmented(), segment_bytes(), segments(), segment_mapped(i), slots(),
+/// slot_offset(s) and segment_slots(i, lo, hi) (strata::core::ExpertCache).  A card's band is fixed when it is added, from the slots its floor keeps
 /// and the most slots the prompt path's loan takes from the tail; what it can lend is the band's segments mapped now,
 /// so a lease shrinks it by its own size and a return grows it again.  Should the live slots get fewer (#533's shrink
 /// of the tail), the loan moves down with them and the band's end follows it.
 ///
-/// No lease is taken here: lend() refuses every lend with nothing lendable now (ERR MAX 0) and give_back() has
-/// nothing to give back.  The engine derives from it to take and return the segments.
+/// A lend takes the coldest of those segments by the expert profile's rank (band_coldness: the experts in their
+/// slots are the ones the cache misses least), rounded up to whole segments, through the engine's take hook - which
+/// evicts the slots that touch them, quiets the devices and unmaps them - and keeps them as a SegmentLease under the
+/// token LendCommands gets back.  Without a take hook nothing can be taken: every lend is refused with nothing
+/// lendable now (ERR MAX 0).  give_back() has nothing to give back yet (busy).
 template <class Cache>
 class SegmentLendCache : public LendCache {
 public:
@@ -154,9 +168,7 @@ public:
     std::int64_t lendable_segments(const Card& c) const {
         const Cache& x = *c.cache;
         if (!x.segmented() || c.band.segments() == 0) return 0;
-        std::int64_t end = (std::int64_t) (x.slot_offset(loan_start(c)) / (std::uint64_t) x.segment_bytes());
-        if (end > c.band.end) end = c.band.end;
-        if (end > x.segments()) end = x.segments();
+        const std::int64_t end = band_end_now(c);
         std::int64_t k = 0;
         for (std::int64_t i = c.band.first; i < end; ++i) k += x.segment_mapped(i) ? 1 : 0;
         return k;
@@ -171,16 +183,102 @@ public:
         }
         return out;
     }
-    LendTaken lend(int, std::size_t) override { return {}; }
+
+    /// (segment, coldness) of every segment a lease may take now: the band's mapped segments below where the loan
+    /// starts now, in segment order.  Coldness is the mean of `ranks[s]` over the slots that touch the segment (a slot
+    /// that straddles its edge goes with it); `ranks` holds each live slot's expert's rank in the profile, hottest 0 -
+    /// the engine gives an empty slot one past the coldest, so it counts as coldest.
+    std::vector<std::pair<std::int64_t, double>> band_coldness(const Card& c, const std::vector<std::int64_t>& ranks) const {
+        std::vector<std::pair<std::int64_t, double>> out;
+        const Cache& x = *c.cache;
+        if (!x.segmented() || c.band.segments() == 0) return out;
+        const std::int64_t end = band_end_now(c);
+        for (std::int64_t i = c.band.first; i < end; ++i) {
+            if (!x.segment_mapped(i)) continue;
+            std::int64_t lo = 0, hi = 0;
+            x.segment_slots(i, lo, hi);
+            double sum = 0.0;
+            std::int64_t n = 0;
+            for (std::int64_t s = lo; s < hi && s < (std::int64_t) ranks.size(); ++s, ++n) sum += (double) ranks[(size_t) s];
+            out.emplace_back(i, n > 0 ? sum / (double) n : 0.0);
+        }
+        return out;
+    }
+    /// The `n` coldest of `cold` (a tie: the higher segment, nearer the tail, as the profile fill ranks them), in
+    /// segment order.
+    static std::vector<std::int64_t> coldest(std::vector<std::pair<std::int64_t, double>> cold, std::int64_t n) {
+        std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) {
+            return a.second != b.second ? a.second > b.second : a.first > b.first;
+        });
+        std::vector<std::int64_t> out;
+        for (std::int64_t k = 0; k < n && k < (std::int64_t) cold.size(); ++k) out.push_back(cold[(size_t) k].first);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    /// The engine's part of a lend: take the chosen segments `lease.segs` of card `c` out of the cache (evict the
+    /// slots that touch them, recording them in `lease.evicted`, and unmap them), given the band's coldness the choice
+    /// was made from (for its log).  False: nothing is lent and the cache is as before (or as close as the driver let
+    /// it: the segments it could not map back stay out of what is lendable).
+    using TakeFn = std::function<bool(const Card& c, SegmentLease& lease,
+                                      const std::vector<std::pair<std::int64_t, double>>& cold)>;
+    /// Each live slot's rank as band_coldness() reads it, for card `c` now.  Unset: every slot ranks the same, and the
+    /// band's last segments go first.
+    using RanksFn = std::function<std::vector<std::int64_t>(const Card& c)>;
+    void set_take(TakeFn f) { take_ = std::move(f); }
+    void set_ranks(RanksFn f) { ranks_ = std::move(f); }
+
+    LendTaken lend(int dev, std::size_t bytes) override {
+        LendTaken r;
+        const Card* c = nullptr;
+        for (const Card& k : cards_)
+            if (k.dev == dev) c = &k;
+        if (c == nullptr || !c->cache->segmented() || !take_) return r;   // nothing takes segments: nothing lendable
+        const std::size_t seg = (std::size_t) c->cache->segment_bytes();
+        const std::int64_t have = lendable_segments(*c);
+        r.max_bytes = (std::size_t) have * seg;
+        const std::int64_t n = (std::int64_t) ((bytes + seg - 1) / seg);
+        if (n <= 0 || n > have) return r;
+        const std::vector<std::pair<std::int64_t, double>> cold =
+            band_coldness(*c, ranks_ ? ranks_(*c) : std::vector<std::int64_t>((size_t) c->cache->slots(), 0));
+        SegmentLease lease;
+        lease.dev = dev;
+        lease.segs = coldest(cold, n);
+        if ((std::int64_t) lease.segs.size() != n || !take_(*c, lease, cold)) {
+            r.max_bytes = (std::size_t) lendable_segments(*c) * seg;
+            return r;
+        }
+        r.ok = true;
+        r.bytes = (std::size_t) n * seg;
+        r.token = next_token_++;
+        leases_.emplace(r.token, std::move(lease));
+        return r;
+    }
     GiveBack give_back(int, std::uint64_t) override { return GiveBack::busy; }
 
-private:
-    // the first slot of the prompt path's largest loan in the live slots now (the end of them without a loan)
+    /// The open leases, by the token lend() handed out.
+    const std::map<std::uint64_t, SegmentLease>& leases() const { return leases_; }
+
+    /// The first slot of the prompt path's largest loan in the live slots now (the end of them without a loan).
     static std::int64_t loan_start(const Card& c) {
         const std::int64_t n = c.cache->slots();
         return c.loan_slots <= 0 ? n : c.loan_slots >= n ? 0 : n - c.loan_slots;
     }
+
+private:
+    // the band's end now: below where the loan starts now (a shrink of the tail moves it down)
+    std::int64_t band_end_now(const Card& c) const {
+        const Cache& x = *c.cache;
+        std::int64_t end = (std::int64_t) (x.slot_offset(loan_start(c)) / (std::uint64_t) x.segment_bytes());
+        if (end > c.band.end) end = c.band.end;
+        if (end > x.segments()) end = x.segments();
+        return end;
+    }
     std::vector<Card> cards_;
+    TakeFn take_;
+    RanksFn ranks_;
+    std::uint64_t next_token_ = 1;
+    std::map<std::uint64_t, SegmentLease> leases_;
 };
 
 /// What a control line is to the lend commands, by its first word (split on blanks as LendCommands::handle splits it):
