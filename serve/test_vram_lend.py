@@ -1010,5 +1010,41 @@ class SourceScan(unittest.TestCase):
         self.assertEqual(key.findall(text), [])
 
 
+class CalibrationStarts(unittest.TestCase):
+    """The tuning paths start the engine with the server's arguments, so they too leave --vram-lend out for an engine
+    that does not know it (it would end at the start)."""
+    CFG = {"args": ["--max-context", "8192"], "vram_lend": True}
+
+    def test_the_tuning_measure(self):
+        from tools import calibrate
+        with tempfile.TemporaryDirectory() as d:
+            for text, want in ((OLD_STAND_IN, False), (STAND_IN, True)):
+                cfg = dict(self.CFG, exe=stand_in(Path(d), text))
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual("--vram-lend" in calibrate.engine_args(cfg), want)
+
+    def test_the_smoke_start(self):
+        from strata_control import calibration
+        seen = []
+
+        def engine(exe, args, **kw):
+            seen.append(args)
+            raise RuntimeError("stop here")
+
+        with tempfile.TemporaryDirectory() as d:
+            tok = Path(d) / "tokenizer"
+            tok.mkdir()
+            (tok / "vocab.json").write_text('{"a": 0}')
+            (tok / "merges.txt").write_text("")
+            (tok / "token_type.json").write_text("[1]")
+            cfg = dict(self.CFG, exe=stand_in(Path(d), OLD_STAND_IN), tokenizer=str(tok))
+            with mock.patch("serve.server.StrataEngine", engine), mock.patch("strata_tokenizer.Tokenizer"), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises(RuntimeError):
+                    calibration._smoke(cfg, Path(d) / "strata-x.json")
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("--vram-lend", seen[0])
+
+
 if __name__ == "__main__":
     unittest.main()
