@@ -253,7 +253,7 @@ def engine_args(cfg: dict) -> list[str]:
     broke a one-card config with a helper card for the expert tier ("gpu": [0] + --expert-cache-device1: the engine
     refuses a split that leaves no card without a stage), missed the "0,2" spelling, and ignored split_skip_if_fits."""
     from serve.server import engine_args as server_args
-    return server_args(cfg)
+    return server_args(cfg, cfg.get("exe"))
 
 
 def engine_error(log: str | None, since: int = 0) -> str | None:
