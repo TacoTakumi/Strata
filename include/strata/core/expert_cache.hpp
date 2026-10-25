@@ -105,7 +105,8 @@ public:
     bool valid() const { return base_ != nullptr; }
     /// The slots usable now: all of them, unless `shrink` gave the tail's VRAM back (#533) - then the ones wholly
     /// inside the VRAM still backed, always a prefix.  The prompt path's loan (the last slots) and every report
-    /// follow this; `full_slots()` is what `open` allocated.
+    /// follow this; `full_slots()` is what `open` allocated.  `unmap_segments` can leave holes inside it: then a
+    /// slot below `slots()` is usable only when `slot_usable` says so.
     int64_t slots() const { return live_slots_; }
     int64_t full_slots() const { return slots_; }
     /// Slots actually claimed.  Not the same as `slots()` - the cache does not evict, so a run that routes
@@ -136,7 +137,8 @@ public:
     static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
     bool segmented() const { return !segs_.empty(); }
     int64_t segment_bytes() const { return seg_; }
-    /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
+    /// Bytes of the arena backed by VRAM now: every mapped segment, not the tail and not the holes (the arena when not
+    /// segmented).
     int64_t mapped_bytes() const;
     /// Unmaps every segment past the first `keep_bytes` (rounded UP to a segment boundary): `slots()` becomes the
     /// slots wholly inside what stays.  Waits for the device first.  False with `err` when not segmented or a driver
@@ -154,6 +156,46 @@ public:
     int64_t slots_within(int64_t bytes) const;
     /// The bytes the first `n` slots span.
     int64_t bytes_of(int64_t n) const { return slot_end(n < 0 ? 0 : n > slots_ ? slots_ : n); }
+
+    /// **SEGMENT SETS: UNMAP AND MAP BACK WHOLE SEGMENTS ANYWHERE IN THE LIVE ARENA, NOT ONLY AT THE TAIL.**  Another
+    /// program can borrow the VRAM of chosen segments (the coldest slots, wherever they sit) while the engine keeps
+    /// serving from the rest.  An unmapped segment inside `slots()` is a HOLE: `slots()` stays the prefix up to the
+    /// tail, and a slot that touches a hole (a slot may straddle two segments) is not usable until every segment it
+    /// touches is mapped again - `slot_usable` is the test every admit, pick and swap must make once a hole exists.
+    /// Opt-in: until the first `unmap_segments` there is no hole, every live slot is usable and nothing else changes.
+    /// The tail and the holes coexist: `grow` maps only the tail (never a hole), and `shrink` refuses a keep that
+    /// would take a hole into the tail (the hole's VRAM belongs to whoever it was unmapped for, until `map_segments`).
+    int64_t segments() const { return (int64_t) segs_.size(); }
+    bool segment_mapped(int64_t i) const { return i >= 0 && i < segments() && segs_[(size_t) i] != 0; }
+    /// The segments unmapped by `unmap_segments` and not yet mapped back.
+    int64_t hole_segments() const { return holes_; }
+    /// The slots `[lo, hi)` that touch segment `i` (their blob or guard lies in it, in part or in whole).
+    void segment_slots(int64_t i, int64_t& lo, int64_t& hi) const;
+    /// How many holes slot `s` touches (0: none; 0 also for a bad slot).
+    int32_t slot_holes(int32_t s) const {
+        return s >= 0 && s < (int32_t) slot_holes_.size() ? (int32_t) slot_holes_[(size_t) s] : 0;
+    }
+    /// Slot `s` is live (inside `slots()`) and touches no hole: it may be admitted into, picked, swapped into or lent.
+    bool slot_usable(int32_t s) const {
+        return s >= 0 && s < live_slots_ && (slot_holes_.empty() || slot_holes_[(size_t) s] == 0);
+    }
+    /// The usable slots of `slots()` (all of them while there is no hole).
+    int64_t usable_slots() const;
+    /// Unmaps and releases the segments `segs` (indices, any order, inside the live arena, each mapped, no repeats)
+    /// on the cache's device, which must be current.  Waits for the device first.  The CALLER first takes every slot
+    /// that touches them (`segment_slots`) out of the residency tables and any loan, as for a shrink.  False with
+    /// `err` and nothing changed for a bad set; false with `err` when the driver refuses a release part-way - the
+    /// segments released by then are holes (`segment_mapped` says which).
+    bool unmap_segments(const std::vector<int64_t>& segs, std::string& err);
+    enum class MapResult { ok, busy, refused };
+    /// Maps the holes `segs` back at their addresses, all or nothing: when the driver cannot back one (another program
+    /// still holds the memory) the segments this call mapped are released again and the answer is `busy`, every hole
+    /// as it was.  `refused`: a bad set (not a hole, a repeat, not segmented, not the cache's device), nothing
+    /// changed.  The slots that become usable are empty until the caller fills them.
+    MapResult map_segments(const std::vector<int64_t>& segs, std::string& err);
+    /// Tests only: the segment map after the next `n` succeeds fails as if the driver had no VRAM (-1: off, the
+    /// default).  Applies to every segment map (open, `grow`, `map_segments`) and turns itself off once it fires.
+    static void fail_segment_map_after(int n);
 
     /// `(layer, expert)` -> slot index, or `kNotResident`.  Bounds-checked: a bad layer or expert returns
     /// `kNotResident` rather than reading whatever is adjacent in the table.
@@ -265,7 +307,12 @@ private:
     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
     std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
     std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
-    int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
+    int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed, but for the holes
+    int64_t prefix_bytes() const;       ///< the bytes of segments [0, mapped_segs_), holes included
+    int dev_ = -1;                      ///< the device the segments live on
+    int64_t holes_ = 0;                 ///< segments unmapped by unmap_segments (all below mapped_segs_)
+    std::vector<uint8_t> seg_hole_;     ///< [segments] 1: a hole (empty until the first unmap_segments)
+    std::vector<uint16_t> slot_holes_;  ///< [slots] the holes each slot touches (empty until the first unmap_segments)
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

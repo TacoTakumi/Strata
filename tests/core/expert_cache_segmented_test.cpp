@@ -3,6 +3,9 @@
 // Uniform and sized slots.  Needs a CUDA device with virtual memory management (exits 77 without one).
 // The `VRAM` command's residency bookkeeping on such a cache: a refill or a sync that fails part-way leaves a table
 // that names only slots holding their expert, uploaded to the device as it is, and the next grow puts the rest back.
+// Segment sets: whole segments unmapped and mapped back anywhere in the live arena (holes), a slot that straddles two
+// holes usable only when both are back, a map that fails part-way undone (busy, nothing changed), the driver's free
+// figure moving by exactly the bytes unmapped or mapped, and the tail's shrink and grow beside the holes.
 #include "strata/core/expert_cache.hpp"
 #include "strata/program/vram_rules.hpp"
 
@@ -149,6 +152,124 @@ int vram_error_paths() {
     cudaFree(d_res);
     return rc;
 }
+
+// Segment sets on a cache of 40 slots of 3 MiB in 8 MiB segments (15 segments): slot s spans [3s, 3s + 3) MiB, so
+// slot 10 lies in segments 3 and 4 and slot 13 in segments 4 and 5.  `sized`: the same layout through open_sized.
+int segment_sets(bool sized) {
+    using MR = strata::core::ExpertCache::MapResult;
+    constexpr int64_t kMiB = 1 << 20, kBlob = 3 * kMiB, kSlots = 40, kSeg = 8 * kMiB;
+    const char* mode = sized ? "sets (sized)" : "sets (uniform)";
+    auto f = [&](const char* what, const std::string& err = "") { return fail((std::string(mode) + ": " + what).c_str(), err); };
+    strata::core::ExpertCache c;
+    c.set_segment_bytes(kSeg);
+    std::string err;
+    if (!(sized ? c.open_sized(std::vector<int64_t>(kSlots, kBlob), 4, 64, err) : c.open(kSlots, 4, 64, kBlob, err)))
+        return f("open", err);
+    if (c.segments() != 15 || c.hole_segments() != 0 || c.usable_slots() != kSlots) return f("open: segments");
+    for (int32_t s = 0; s < kSlots; ++s)
+        if (!c.slot_usable(s) || c.slot_holes(s) != 0) return f("open: a slot is not usable");
+    if (c.slot_usable(-1) || c.slot_usable((int32_t) kSlots)) return f("a slot outside the arena is usable");
+    int64_t lo = -1, hi = -1;
+    c.segment_slots(4, lo, hi);
+    if (lo != 10 || hi != 14) return f("segment_slots(4)", std::to_string(lo) + ".." + std::to_string(hi));
+    c.segment_slots(14, lo, hi);
+    if (lo != 37 || hi != 40) return f("segment_slots(14)", std::to_string(lo) + ".." + std::to_string(hi));
+    if (!fill(c, 0, kSlots, kBlob)) return f("fill");
+    const int64_t full = c.mapped_bytes();
+    // every usable slot still holds its own bytes
+    auto intact = [&]() {
+        std::vector<uint8_t> b((size_t) kBlob);
+        for (int32_t s = 0; s < kSlots; ++s) {
+            if (!c.slot_usable(s)) continue;
+            if (cudaMemcpy(b.data(), c.device_slot(s), (size_t) kBlob, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+            for (const uint8_t x : b)
+                if (x != (uint8_t) (s * 7 + 1)) return false;
+        }
+        return true;
+    };
+    auto usable = [&](int32_t from, int32_t to) {   // [from, to] all usable (true) or none of them (false)
+        bool all = true, none = true;
+        for (int32_t s = from; s <= to; ++s) (c.slot_usable(s) ? none : all) = false;
+        return all ? 1 : none ? 0 : -1;
+    };
+    // the driver's view: the free figure moves by exactly the segments' bytes
+    auto moved = [&](size_t before, int64_t want, const char* what) {
+        cudaDeviceSynchronize();
+        const long long d = (long long) free_vram() - (long long) before;
+        if (d == want) return true;
+        std::fprintf(stderr, "%s: %s: free moved %lld bytes, want %lld\n", mode, what, d, (long long) want);
+        return false;
+    };
+    cudaDeviceSynchronize();
+    size_t at = free_vram();
+    // A = segments 3 and 4 (slots 8..13 touch them, slot 10 both)
+    if (!c.unmap_segments({4, 3}, err)) return f("unmap A", err);
+    if (!moved(at, 2 * kSeg, "unmap A")) return 1;
+    if (c.mapped_bytes() != full - 2 * kSeg || c.hole_segments() != 2 || c.segment_mapped(3) || c.segment_mapped(4) ||
+        !c.segment_mapped(2) || !c.segment_mapped(5))
+        return f("unmap A: segments");
+    if (c.slots() != kSlots || c.usable_slots() != kSlots - 6 || usable(8, 13) != 0 || usable(0, 7) != 1 ||
+        usable(14, kSlots - 1) != 1 || c.slot_holes(10) != 2 || c.slot_holes(13) != 1 || c.slot_holes(8) != 1)
+        return f("unmap A: slots");
+    if (!intact()) return f("unmap A: a usable slot lost its bytes");
+    // B = segments 5 and 6 (slots 13..18): slot 13 straddles A and B
+    at = free_vram();
+    if (!c.unmap_segments({5, 6}, err)) return f("unmap B", err);
+    if (!moved(at, 2 * kSeg, "unmap B")) return 1;
+    if (c.mapped_bytes() != full - 4 * kSeg || c.hole_segments() != 4 || c.slot_holes(13) != 2 ||
+        c.usable_slots() != kSlots - 11 || usable(8, 18) != 0 || !intact())
+        return f("unmap B");
+    // bad sets change nothing
+    at = free_vram();
+    if (c.unmap_segments({3}, err) || c.unmap_segments({7, 7}, err) || c.unmap_segments({15}, err) ||
+        c.unmap_segments({-1}, err) || c.map_segments({2}, err) != MR::refused ||
+        c.map_segments({3, 3}, err) != MR::refused || c.map_segments({7, 3}, err) != MR::refused)
+        return f("a bad set was accepted");
+    if (!moved(at, 0, "bad sets") || c.hole_segments() != 4 || !c.segment_mapped(7) || c.segment_mapped(3))
+        return f("a bad set changed the state");
+    // A back: slot 13 still touches B
+    at = free_vram();
+    if (c.map_segments({3, 4}, err) != MR::ok) return f("map A", err);
+    if (!moved(at, -2 * kSeg, "map A")) return 1;
+    if (c.mapped_bytes() != full - 2 * kSeg || c.hole_segments() != 2 || usable(8, 12) != 1 || c.slot_usable(13) ||
+        c.slot_holes(13) != 1 || usable(13, 18) != 0)
+        return f("map A: slot 13 must wait for B");
+    if (!fill(c, 8, 13, kBlob) || !intact()) return f("map A: the slots mapped back");
+    // B with the driver failing its second segment: the first is released again, busy, nothing changed
+    at = free_vram();
+    strata::core::ExpertCache::fail_segment_map_after(1);
+    const MR r = c.map_segments({5, 6}, err);
+    strata::core::ExpertCache::fail_segment_map_after(-1);
+    if (r != MR::busy) return f("a failed map is not busy", err);
+    if (!moved(at, 0, "failed map B")) return 1;
+    if (c.mapped_bytes() != full - 2 * kSeg || c.hole_segments() != 2 || c.segment_mapped(5) || c.segment_mapped(6) ||
+        c.slot_holes(13) != 1 || c.slot_holes(15) != 1 || usable(13, 18) != 0 || !intact())
+        return f("a failed map changed the state");
+    // the tail beside a hole: a shrink into the hole is refused, one above it keeps it, the grow leaves it a hole
+    at = free_vram();
+    if (c.shrink(16 * kMiB, err) || c.slots() != kSlots || !moved(at, 0, "shrink into a hole"))
+        return f("a shrink into a hole was not refused");
+    if (!c.shrink(64 * kMiB, err)) return f("shrink above the holes", err);
+    if (!moved(at, 7 * kSeg, "shrink above the holes")) return 1;   // segments 8..14
+    if (c.slots() != 21 || c.mapped_bytes() != 64 * kMiB - 2 * kSeg || c.slot_usable(21) || usable(13, 18) != 0 ||
+        usable(0, 12) != 1 || c.usable_slots() != 21 - 6 || !intact())
+        return f("shrink above the holes: slots");
+    if (c.unmap_segments({10}, err)) return f("a segment past the tail was unmapped");
+    if (!c.grow(1ll << 40, err) || c.slots() != kSlots || c.segment_mapped(5) || c.segment_mapped(6) ||
+        c.mapped_bytes() != full - 2 * kSeg || c.usable_slots() != kSlots - 6)
+        return f("grow beside the holes", err);
+    if (!fill(c, 19, kSlots, kBlob) || !intact()) return f("grow beside the holes: the slots");
+    // B back, in any order: every slot usable, the arena whole
+    at = free_vram();
+    if (c.map_segments({6, 5}, err) != MR::ok) return f("map B", err);
+    if (!moved(at, -2 * kSeg, "map B")) return 1;
+    if (c.mapped_bytes() != full || c.hole_segments() != 0 || c.usable_slots() != kSlots || usable(0, kSlots - 1) != 1)
+        return f("map B: slots");
+    if (!fill(c, 13, 19, kBlob) || !intact()) return f("map B: the slots mapped back");
+    c.close();
+    if (c.segments() != 0 || c.hole_segments() != 0 || c.slot_holes(10) != 0) return f("close");
+    return 0;
+}
 }  // namespace
 
 int main() {
@@ -203,8 +324,13 @@ int main() {
     strata::core::ExpertCache d;
     std::string err;
     if (!d.open(8, 2, 4, kBlob, err) || d.segmented() || d.shrink(0, err)) return fail("unsegmented", err);
+    if (d.unmap_segments({0}, err) || d.map_segments({0}, err) != strata::core::ExpertCache::MapResult::refused ||
+        d.usable_slots() != 8 || !d.slot_usable(7))
+        return fail("unsegmented: segment sets");
     if (vram_error_paths() != 0) return 1;
+    if (segment_sets(false) != 0 || segment_sets(true) != 0) return 1;
     std::puts("expert cache segments: shrink gives VRAM back and keeps the slots, grow maps them again; a failed "
-              "refill or sync leaves the residency table naming only slots that hold their expert");
+              "refill or sync leaves the residency table naming only slots that hold their expert; segment sets unmap and map "
+              "back anywhere, all or nothing, beside the tail");
     return 0;
 }
