@@ -12290,8 +12290,16 @@ int main(int argc, char** argv) {
                 return k;
             };
             lend_cache = std::make_unique<strata::core::SegmentLendCache<strata::core::ExpertCache>>();
+            // A lease evicts experts through the host residency table, and they are computed on the CPU from RAM
+            // while it is out.  Without the table, or in the resident low-RAM mode (the cache holds experts RAM does
+            // not) or with --peer-device, no card lends: a floor of every slot leaves each band empty.
+            const char* lends_none = host_res.empty() ? "the run has no host residency table"
+                                   : src.complement_ready() ? "the resident low-RAM mode (the cache holds experts RAM does not)"
+                                   : peer.valid() ? "--peer-device" : nullptr;
+            if (lends_none != nullptr)
+                std::fprintf(stderr, "strata generate: VRAM Lend: nothing to lend: %s\n", lends_none);
             auto lend_card = [&](int dev, const strata::core::ExpertCache& c) {
-                const auto& k = lend_cache->add(dev, c, kLendFloorSlots, loan_slots(c));
+                const auto& k = lend_cache->add(dev, c, lends_none != nullptr ? c.slots() : kLendFloorSlots, loan_slots(c));
                 const double mib = 1048576.0;
                 const int64_t at = k.loan_slots > 0 ? c.slots() - k.loan_slots : c.slots();
                 const double pool = (double) c.bytes() / mib, floor_end = (double) c.bytes_of(kLendFloorSlots) / mib;
@@ -12321,12 +12329,18 @@ int main(int argc, char** argv) {
             for (const auto& st : stages) no_lend->add(st->dev, unsegmented, 0, 0);
             lends = std::make_unique<strata::core::LendCommands>(*no_lend);
         }
+        // what the last lease took, for its log line once its id is known (the lend's take hook fills it)
+        std::string lend_note;
         // a lend command's answer: whole lines from the main thread between two steps, never inside a request's lines
         auto lend_reply = [&](const std::string& l) {
             std::string reply;
+            lend_note.clear();
             if (lends != nullptr) lends->handle(l, reply);
             std::fputs(reply.c_str(), stdout);
             std::fflush(stdout);
+            unsigned long long id = 0;
+            if (!lend_note.empty() && std::sscanf(reply.c_str(), "LENT %llu", &id) == 1)
+                std::fprintf(stderr, "strata serve: VRAM Lend: lease %llu %s\n", id, lend_note.c_str());
         };
         // every waiting lend command, in the order they came: when idle, and at the end of each decode window
         auto serve_lends = [&] {
@@ -12628,8 +12642,18 @@ int main(int argc, char** argv) {
                         se = "VRAM: " + ferr;
                         return false;
                     };
-                    if (!strata::program::vram_rules::refill(host_res, xc.slots(), evicted, pick_miss, fill, sync, e))
-                        return false;
+                    // --vram-lend too: a slot that touches a lease's hole is not filled - its row stays owed
+                    strata::program::vram_rules::Evicted held;
+                    if (xc.hole_segments() > 0) {
+                        strata::program::vram_rules::Evicted fillable;
+                        for (const auto& pr : evicted)
+                            (xc.slot_usable(pr.second) || pr.second >= xc.slots() ? fillable : held).push_back(pr);
+                        evicted.swap(fillable);
+                    }
+                    const bool refilled =
+                        strata::program::vram_rules::refill(host_res, xc.slots(), evicted, pick_miss, fill, sync, e);
+                    evicted.insert(evicted.end(), held.begin(), held.end());
+                    if (!refilled) return false;
                 }
                 // nothing to tell the verifiers: each window's refresh_ar (#871) reads the host residency table, so
                 // a stage that was 100% resident at init takes the doorbell graph once this shrink marks one -1
@@ -12657,6 +12681,193 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             return true;
         };
+#if !defined(STRATA_USE_HIP)
+        // VRAM Lend: a lease takes whole segments of one card's band, the coldest by the expert profile's rank - each
+        // residency row's place in the whole profile, hottest 0; an unranked expert and an empty slot rank one past
+        // the coldest - and keeps this order before the unmap (cuMemUnmap does not wait for kernels in flight):
+        //   1. quiet: every verifier's window commit lands, then the adaptive tier's moves in flight (an asynchronous
+        //      round too); no new one starts before the lend returns (the tier runs from the decode loop);
+        //   2. the experts in every slot that touches the segments leave the host residency table (each with its slot,
+        //      for the return), and the table goes up to every device that keeps a copy;
+        //   3. the lent GPU synchronises: no stream there still reads a slot;
+        //   4. the segments are unmapped and released.
+        // From the table edit on, every exit puts the table as it is on the devices (a scope guard).  A failure before
+        // the unmap puts the experts back in their slots (nothing wrote them); one inside it maps the released
+        // segments back and refills the slots from RAM.  Answered only where nothing is in flight: idle and at a
+        // decode window's end.
+        using LendCards = strata::core::SegmentLendCache<strata::core::ExpertCache>;
+        const std::vector<std::pair<int32_t, int32_t>>& lend_ranked = profile_all.empty() ? profile : profile_all;
+        const int64_t lend_past = (int64_t) lend_ranked.size();   // the rank of an unranked expert or an empty slot
+        std::vector<int64_t> lend_rank;                            // per residency row
+        if (lend_cache != nullptr) {
+            lend_rank.assign(host_res.size(), lend_past);
+            for (size_t r = 0; r < lend_ranked.size(); ++r) {
+                const size_t i = (size_t) lend_ranked[r].first * (size_t) g.n_expert + (size_t) lend_ranked[r].second;
+                if (i < lend_rank.size() && lend_rank[i] == lend_past) lend_rank[i] = (int64_t) r;
+            }
+        }
+        auto lend_target = [&](const strata::core::ExpertCache* c, VramTarget& out) {
+            for (const VramTarget& t : vram_targets())
+                if (t.cache == c) { out = t; return true; }
+            return false;
+        };
+        // residency row i is one of target idx's (slot numbers are per cache)
+        auto lend_owns = [&](size_t i, size_t idx) {
+            return (stages.empty() ? (size_t) 0 : (size_t) stage_of((int64_t) i / g.n_expert)) == idx;
+        };
+        if (lend_cache != nullptr) {
+            lend_cache->set_ranks([&](const LendCards::Card& c) {
+                std::vector<int64_t> r((size_t) std::max<int64_t>(c.cache->slots(), 0), lend_past);
+                VramTarget t{};
+                if (!lend_target(c.cache, t)) return r;
+                for (size_t i = 0; i < host_res.size(); ++i) {
+                    const int32_t s = host_res[i];
+                    if (s >= 0 && s < (int32_t) r.size() && lend_owns(i, t.idx)) r[(size_t) s] = lend_rank[i];
+                }
+                return r;
+            });
+            lend_cache->set_take([&](const LendCards::Card& c, strata::core::SegmentLease& lease,
+                                     const std::vector<std::pair<int64_t, double>>& cold) -> bool {
+                const auto t0 = Clock::now();
+                VramTarget t{};
+                if (!lend_target(c.cache, t)) return false;
+                strata::core::ExpertCache& xc = *t.cache;
+                std::string e;
+                auto fail = [&](const std::string& why) {
+                    std::fprintf(stderr, "strata serve: VRAM Lend: a lend of %zu segments on GPU %d failed: %s\n",
+                                 lease.segs.size(), t.dev, why.c_str());
+                    return false;
+                };
+                // 1. quiet
+                if (!ver.wait_commit(e)) return fail(e);
+                for (auto& st : stages)
+                    if (!st->ver.wait_commit(e)) return fail(e);
+                adapt_quiesce();
+                const auto t1 = Clock::now();
+                // 2. the slots out of the tables
+                const int64_t n = xc.slots();
+                std::vector<uint8_t> leaving((size_t) std::max<int64_t>(n, 0), 0);
+                for (const int64_t sg : lease.segs) {
+                    int64_t lo = 0, hi = 0;
+                    xc.segment_slots(sg, lo, hi);
+                    for (int64_t s = lo; s < hi && s < n; ++s) leaving[(size_t) s] = 1;
+                }
+                auto leaves = [&](int32_t s) { return s >= 0 && s < n && leaving[(size_t) s] != 0; };
+                for (const PfPart& p : pf_parts)   // the band lies below every loan: a lent slot in it is a layout bug
+                    if (p.cache == &xc)
+                        for (const auto& pr : p.lent)
+                            if (leaves(pr.second)) return fail("a prompt's loan holds a slot of the band");
+                lease.evicted.clear();
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (leaves(host_res[i]) && lend_owns(i, t.idx)) {
+                        lease.evicted.emplace_back((int32_t) i, host_res[i]);
+                        host_res[i] = strata::core::kNotResident;
+                    }
+                struct LendSettle {
+                    decltype(res_upload)& upload;
+                    bool due = true;
+                    cudaError_t run() {
+                        if (!due) return cudaSuccess;
+                        due = false;
+                        return upload();
+                    }
+                    ~LendSettle() { (void) run(); }
+                } settle{res_upload};
+                auto restore = [&] {   // before the unmap: the experts are still in their slots
+                    for (const auto& [i, s] : lease.evicted) host_res[(size_t) i] = s;
+                    lease.evicted.clear();
+                    settle.due = true;
+                };
+                if (const cudaError_t ur = settle.run(); ur != cudaSuccess) {
+                    restore();
+                    return fail(std::string("the residency table upload failed: ") + cudaGetErrorString(ur));
+                }
+                const auto t2 = Clock::now();
+                // 3. the lent GPU synchronises
+                const strata::core::OnDevice on(t.dev == 0 ? -1 : t.dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    restore();
+                    return fail(cudaGetErrorString(cudaGetLastError()));
+                }
+                const auto t3 = Clock::now();
+                // 4. unmap
+                if (!xc.unmap_segments(lease.segs, e)) {
+                    std::vector<int64_t> gone;   // released before the driver refused one: holes now
+                    for (const int64_t sg : lease.segs)
+                        if (!xc.segment_mapped(sg)) gone.push_back(sg);
+                    if (gone.empty()) {
+                        restore();
+                        return fail(e);
+                    }
+                    std::string merr;
+                    const bool back = xc.map_segments(gone, merr) == strata::core::ExpertCache::MapResult::ok;
+                    // every expert whose slot is usable again is copied back from RAM (a slot in a segment that was
+                    // released lost its bytes); one that touches a hole the driver did not back stays a CPU miss
+                    strata::program::vram_rules::Evicted owed, lost;
+                    for (const auto& pr : lease.evicted) (xc.slot_usable(pr.second) ? owed : lost).push_back(pr);
+                    auto fill = [&](int64_t row, int32_t slot, std::string& fe) {
+                        const int64_t layer = row / g.n_expert;
+                        std::string ferr;
+                        const uint8_t* b = srcp->blob_stable(layer, row % g.n_expert);
+                        if (b == nullptr || !xc.fill_slot_queued(slot, b, ferr,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                            fe = "refilling the cache failed: " + ferr;
+                            return false;
+                        }
+                        srcp->note_async_read(b, nullptr);   // #1237
+                        return true;
+                    };
+                    auto sync = [&](std::string& se) { return xc.sync_queued(se); };
+                    std::string rerr;
+                    strata::program::vram_rules::refill(host_res, n, owed, [](int64_t) -> int64_t { return -1; }, fill,
+                                                        sync, rerr);
+                    lease.evicted.clear();
+                    settle.due = true;
+                    return fail(e + (back ? "" : "; mapping the released segments back failed: " + merr) + "; " +
+                                std::to_string(owed.size() + lost.size()) + " experts stay CPU misses" +
+                                (rerr.empty() ? "" : " (" + rerr + ")"));
+                }
+                const auto t4 = Clock::now();
+                // the log line (lend_reply prints it with the lease id)
+                auto ms = [](Clock::time_point a, Clock::time_point b) {
+                    return std::chrono::duration<double, std::milli>(b - a).count();
+                };
+                double cmin = 1e300, cmax = -1e300, kmin = 1e300, kmax = -1e300;
+                for (const auto& [sg, v] : cold) {
+                    const bool taken = std::binary_search(lease.segs.begin(), lease.segs.end(), sg);
+                    double& lo = taken ? cmin : kmin;
+                    double& hi = taken ? cmax : kmax;
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+                std::string list;
+                for (const int64_t sg : lease.segs) list += (list.empty() ? "" : " ") + std::to_string(sg);
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                const double mib = 1048576.0, sb = (double) xc.segment_bytes();
+                const int64_t floor_s = std::min<int64_t>(std::max<int64_t>(c.floor_slots, 0), n);
+                const int64_t loan_s = LendCards::loan_start(c);
+                char buf[1024];
+                std::snprintf(buf, sizeof buf,
+                              "on GPU %d: %zu segments of %.0f MiB (%.0f MiB) [%s], MiB %.0f-%.0f of the cache, from the "
+                              "band [%lld, %lld): the %lld-slot floor ends at %.0f MiB, the loan starts at %.0f MiB (slot "
+                              "%lld); coldest by profile rank (mean rank per segment): taken %.0f-%.0f, kept %s; %zu "
+                              "experts out to the CPU; %.1f ms (quiet %.1f, tables %.1f, sync %.1f, unmap %.1f), %lld "
+                              "MiB free now",
+                              t.dev, lease.segs.size(), sb / mib, (double) lease.segs.size() * sb / mib, list.c_str(),
+                              (double) lease.segs.front() * sb / mib, (double) (lease.segs.back() + 1) * sb / mib,
+                              (long long) c.band.first, (long long) c.band.end, (long long) floor_s,
+                              (double) xc.slot_offset(floor_s) / mib, (double) xc.slot_offset(loan_s) / mib,
+                              (long long) loan_s, cmin, cmax,
+                              kmin <= kmax ? (std::to_string((long long) kmin) + "-" + std::to_string((long long) kmax)).c_str()
+                                           : "none",
+                              lease.evicted.size(), ms(t0, t4), ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4),
+                              (long long) (free_b >> 20));
+                lend_note = buf;
+                return true;
+            });
+        }
+#endif
         // ---- --batch: the slots of the batch windows
         struct BSlot {
             bool active = false, stop = false;

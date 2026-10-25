@@ -113,6 +113,14 @@ struct FakeSegCache {
     bool segment_mapped(int64_t i) const { return i >= 0 && i < segments() && mapped[(size_t) i]; }
     int64_t slots() const { return n; }
     uint64_t slot_offset(int64_t s) const { return (uint64_t) s * stride; }
+    // the slots [lo, hi) that touch segment i (as ExpertCache::segment_slots: a slot that straddles its edge counts)
+    void segment_slots(int64_t i, int64_t& lo, int64_t& hi) const {
+        const uint64_t a = (uint64_t) i * (uint64_t) seg, b = a + (uint64_t) seg;
+        lo = (int64_t) (a / stride);
+        hi = (int64_t) ((b + stride - 1) / stride);
+        if (lo > n) lo = n;
+        if (hi > n) hi = n;
+    }
 };
 
 }  // namespace
@@ -391,6 +399,97 @@ int main() {
         CHECK_REPLY(d, "RETURN 1", "ERR UNKNOWN 1\n");
         CHECK(d.open_leases() == 0);
         CHECK_REPLY(d, "LENDABLE", want);
+    }
+
+    // ---- a lease takes the coldest whole segments of the band by the expert profile's rank, through the engine's
+    // take hook, and the cache keeps which segments each lease holds
+    {
+        using SLC = SegmentLendCache<FakeSegCache>;
+        using Cold = std::vector<std::pair<int64_t, double>>;
+        // 100 slots of 10 MiB, 64 MiB segments (16, the last one shorter); a 10-slot floor and a 20-slot loan: the
+        // band is segments [2, 12) (the floor ends at 100 MiB inside segment 1, the loan starts at 800 MiB)
+        FakeSegCache c(100, 10 * M, 64 * (int64_t) M);
+        SLC lc;
+        const SLC::Card k = lc.add(0, c, 10, 20);
+        CHECK(k.band.first == 2 && k.band.end == 12);
+        CHECK(SLC::loan_start(k) == 80);
+        std::vector<int64_t> ranks(100);
+        for (int64_t s = 0; s < 100; ++s) ranks[(size_t) s] = s;   // as the profile fill leaves it: slot order is rank order
+        // coldness per band segment: the mean rank of the slots that touch it, straddlers included
+        const Cold cold = lc.band_coldness(k, ranks);
+        CHECK(cold.size() == 10 && cold.front().first == 2 && cold.back().first == 11);
+        int64_t lo = 0, hi = 0;
+        c.segment_slots(2, lo, hi);
+        CHECK(lo == 12 && hi == 20);   // 128..192 MiB: slots 12..19 (slot 19 straddles into segment 3)
+        CHECK(cold.front().second == (12 + 19) / 2.0);
+        // with ranks in slot order the coldest are the band's last segments, given in segment order
+        CHECK((SLC::coldest(cold, 3) == std::vector<int64_t>{9, 10, 11}));
+        CHECK(SLC::coldest(cold, 0).empty() && SLC::coldest(cold, 99).size() == 10);
+        // the adaptive tier moved experts: cold ones sit in segment 4's slots, hot ones in segment 11's (neither in a
+        // slot that straddles into a neighbour)
+        std::vector<int64_t> moved = ranks;
+        c.segment_slots(4, lo, hi);
+        for (int64_t s = lo + 1; s < hi - 1; ++s) moved[(size_t) s] = 1000 + s;
+        c.segment_slots(11, lo, hi);
+        for (int64_t s = lo + 1; s < hi - 1; ++s) moved[(size_t) s] = s - 100;
+        CHECK((SLC::coldest(lc.band_coldness(k, moved), 2) == std::vector<int64_t>{4, 10}));
+        // a tie goes to the higher segment (nearer the tail)
+        CHECK((SLC::coldest({{3, 5.0}, {7, 5.0}, {5, 5.0}}, 2) == std::vector<int64_t>{5, 7}));
+        // a segment of empty slots (the engine ranks them one past the coldest expert) is the coldest
+        std::vector<int64_t> empty = ranks;
+        c.segment_slots(3, lo, hi);
+        for (int64_t s = lo; s < hi; ++s) empty[(size_t) s] = 100;
+        CHECK((SLC::coldest(lc.band_coldness(k, empty), 1) == std::vector<int64_t>{3}));
+
+        // LEND through the lend commands.  No take hook: nothing can be taken (ERR MAX 0)
+        LendCommands d(lc);
+        CHECK_REPLY(d, "LEND 0 64", "ERR MAX 0\n");
+        // the engine's hook gets the card, the chosen segments and the band's coldness now; it unmaps them (here: marks
+        // them) and records what it evicted in the lease
+        std::vector<std::vector<int64_t>> took;
+        std::vector<size_t> cold_seen;
+        bool refuse = false;
+        int ranks_dev = -1;
+        lc.set_ranks([&](const SLC::Card& cc) { ranks_dev = cc.dev; return moved; });
+        lc.set_take([&](const SLC::Card& cc, strata::core::SegmentLease& l, const Cold& cl) {
+            cold_seen.push_back(cl.size());
+            if (refuse || cc.dev != 0) return false;
+            took.push_back(l.segs);
+            for (int64_t s : l.segs) c.mapped[(size_t) s] = false;
+            l.evicted.push_back({7, (int32_t) l.segs[0]});
+            return true;
+        });
+        // 100 MiB is two segments (rounded up): the two coldest, 4 and 10
+        const size_t before = lc.lend_cards()[0].lendable_bytes;
+        CHECK(before == 10 * 64 * M);
+        std::string r;
+        CHECK(d.handle("LEND 0 100", r) && lent_id(r, 0, 128) != 0);
+        const uint64_t id1 = lent_id(r, 0, 128);
+        CHECK(ranks_dev == 0 && took.size() == 1 && (took[0] == std::vector<int64_t>{4, 10}) && cold_seen[0] == 10);
+        CHECK(lc.lend_cards()[0].lendable_bytes == before - 2 * 64 * M);
+        CHECK(lc.leases().size() == 1 && lc.leases().begin()->second.dev == 0 &&
+              (lc.leases().begin()->second.segs == std::vector<int64_t>{4, 10}) &&
+              lc.leases().begin()->second.evicted.size() == 1);
+        // the next lease takes the coldest of what is still mapped (segment 9), never a lent one
+        CHECK(d.handle("LEND 0 64", r) && lent_id(r, 0, 64) != 0 && lent_id(r, 0, 64) != id1);
+        CHECK(took.size() == 2 && (took[1] == std::vector<int64_t>{9}) && cold_seen[1] == 8);
+        CHECK(lc.leases().size() == 2 && d.open_leases() == 2);
+        CHECK_REPLY(d, "LENDABLE", "LENDABLE dev=0 lendable=448 lent=192\nEND\n");
+        // more than is lendable: refused before the hook; a hook that fails: refused with what is lendable, no lease
+        CHECK_REPLY(d, "LEND 0 449", "ERR MAX 448\n");
+        CHECK(cold_seen.size() == 2);
+        refuse = true;
+        CHECK_REPLY(d, "LEND 0 64", "ERR MAX 448\n");
+        CHECK(cold_seen.size() == 3 && took.size() == 2 && lc.leases().size() == 2 && d.open_leases() == 2);
+        // a card that is not segmented never reaches the hook
+        FakeSegCache flat(100, 10 * M, 0);
+        SLC lc3;
+        lc3.add(5, flat, 10, 20);
+        bool called = false;
+        lc3.set_take([&](const SLC::Card&, strata::core::SegmentLease&, const Cold&) { called = true; return true; });
+        LendCommands d3(lc3);
+        CHECK_REPLY(d3, "LEND 5 1", "ERR MAX 0\n");
+        CHECK(!called);
     }
 
     std::printf("vram_lend_test: all checks passed\n");
