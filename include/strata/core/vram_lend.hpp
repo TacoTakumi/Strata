@@ -39,6 +39,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -324,43 +325,61 @@ public:
     }
     /// The next batch for card `dev`: up to `max_rows` owed rows whose slot is usable now (`usable(slot)`), taken out of
     /// the list in the order they were owed.  A row that is resident again (`resident(row)`: the adaptive tier brought
-    /// it back into another slot) gives its slot to `pick(row)` instead, the row the engine wants there most (-1: none;
-    /// a pick that is resident or already in the batch is not taken).  A row whose slot another expert holds now
-    /// (`taken(slot)`, or a row before it in the batch) is owed no more and leaves the list; a row whose slot is not
-    /// usable stays.
+    /// it back into another slot), or that an earlier pick of this batch put in another slot, gives its slot to
+    /// `pick(row)` instead, the row the engine wants there most (-1: none).  A pick that is a row of the batch already
+    /// is asked again (the engine's pick gives each row once per batch); a pick that is resident ends the asking.  A
+    /// row whose slot another expert holds now (`taken(slot)`) or that gets no pick is owed no more and leaves the
+    /// list (counted in lost()), as does a row whose slot is in the batch already (a slot named twice); a row whose
+    /// slot is not usable stays.
     template <class Usable, class Resident, class Taken, class Pick>
     std::vector<Row> next(int dev, std::size_t max_rows, Usable&& usable, Resident&& resident, Taken&& taken,
                           Pick&& pick) {
         std::vector<Row> out;
         const auto it = owed_.find(dev);
         if (it == owed_.end()) return out;
+        Lost& lost = lost_[dev];
         std::vector<Row> keep;
-        auto in_batch = [&](const Row& r) {
-            for (const Row& o : out)
-                if (o.first == r.first || o.second == r.second) return true;
-            return false;
-        };
+        std::unordered_set<std::int32_t> rows, slots;   // the batch's
+        auto row_in_batch = [&](std::int32_t row) { return rows.count(row) != 0; };
+        auto slot_in_batch = [&](std::int32_t slot) { return slots.count(slot) != 0; };
         for (const Row& r : it->second) {
             if (out.size() >= max_rows || !usable(r.second)) {
                 keep.push_back(r);
                 continue;
             }
-            if (taken(r.second)) continue;
+            if (taken(r.second)) { ++lost.taken; continue; }
+            if (slot_in_batch(r.second)) continue;
             Row f = r;
-            if (resident(r.first)) {
-                const std::int64_t p = pick(r.first);
-                if (p < 0 || resident((std::int32_t) p)) continue;
-                f.first = (std::int32_t) p;
+            if (resident(r.first) || row_in_batch(r.first)) {
+                f.first = -1;
+                for (std::size_t ask = 0; ask <= out.size(); ++ask) {   // each row of the batch at most once
+                    const std::int64_t p = pick(r.first);
+                    if (p < 0 || resident((std::int32_t) p)) break;
+                    if (!row_in_batch((std::int32_t) p)) { f.first = (std::int32_t) p; break; }
+                }
+                if (f.first < 0) { ++lost.no_pick; continue; }
             }
-            if (in_batch(f)) continue;
             out.push_back(f);
+            rows.insert(f.first);
+            slots.insert(f.second);
         }
         it->second.swap(keep);
         return out;
     }
+    /// What card `dev`'s batches gave up since reset_lost(dev): rows whose slot another expert held, and slots whose
+    /// row was resident again and found no other expert to take them.
+    struct Lost {
+        std::size_t taken = 0, no_pick = 0;
+    };
+    Lost lost(int dev) const {
+        const auto it = lost_.find(dev);
+        return it == lost_.end() ? Lost{} : it->second;
+    }
+    void reset_lost(int dev) { lost_.erase(dev); }
 
 private:
     std::map<int, std::vector<Row>> owed_;
+    std::map<int, Lost> lost_;
 };
 
 /// What a control line is to the lend commands, by its first word (split on blanks as LendCommands::handle splits it):

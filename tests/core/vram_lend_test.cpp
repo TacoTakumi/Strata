@@ -592,6 +592,31 @@ int main() {
         }
         CHECK(fill.empty() && fill.owed(0) == 0);
     }
+    // ---- no slot is left empty for want of bookkeeping: a pick that is a row of the batch already is asked again,
+    // and a row that an earlier pick of the batch put in another slot gives its own slot to a pick
+    {
+        using strata::core::LendRefill;
+        LendRefill fill;
+        auto all = [](int32_t) { return true; };
+        auto none = [](int32_t) { return false; };
+        // 72 came back into another slot; the engine's picks for its slot, hottest first, each once: 70 (owed, in the
+        // batch already), then 80
+        fill.owe(8, {{70, 1}, {71, 2}, {72, 3}});
+        std::vector<int32_t> picks8{70, 80};
+        size_t k8 = 0;
+        auto pick8 = [&](int32_t) -> int64_t { return k8 < picks8.size() ? picks8[k8++] : -1; };
+        std::vector<LendRefill::Row> got =
+            fill.next(8, 10, all, [](int32_t row) { return row == 72; }, none, pick8);
+        CHECK((got == std::vector<LendRefill::Row>{{70, 1}, {71, 2}, {80, 3}}) && k8 == 2 && fill.owed(8) == 0);
+        // 50 came back; its slot's pick is 51, an owed row further on: 51's own slot then gets the next pick, 60
+        fill.owe(7, {{50, 1}, {51, 2}, {52, 3}, {53, 4}});
+        std::vector<int32_t> picks7{51, 60};
+        size_t k7 = 0;
+        auto pick7 = [&](int32_t) -> int64_t { return k7 < picks7.size() ? picks7[k7++] : -1; };
+        got = fill.next(7, 10, all, [](int32_t row) { return row == 50; }, none, pick7);
+        CHECK((got == std::vector<LendRefill::Row>{{51, 1}, {60, 2}, {52, 3}, {53, 4}}) && k7 == 2 && fill.empty());
+        CHECK(fill.lost(7).no_pick == 0 && fill.lost(8).no_pick == 0);
+    }
     // ---- the refill's batches: in the order owed, up to the batch size; a row resident again or whose slot another
     // expert holds is owed no more; a slot named twice is filled once
     {
@@ -612,6 +637,9 @@ int main() {
         got = fill.next(3, 10, [](int32_t s) { return s != 6; }, resident, landed, nopick);
         // 12 resident (no other row wanted), 13's and 15's slots taken: out; 16's slot is not usable: it stays
         CHECK((got == std::vector<LendRefill::Row>{{14, 5}}) && fill.owed(3) == 1);
+        CHECK(fill.lost(3).taken == 2 && fill.lost(3).no_pick == 1 && fill.lost(4).taken == 0);
+        fill.reset_lost(3);
+        CHECK(fill.lost(3).taken == 0 && fill.lost(3).no_pick == 0);
         got = fill.next(3, 10, all, resident, taken, nopick);
         CHECK((got == std::vector<LendRefill::Row>{{16, 6}}) && fill.owed(3) == 0 && !fill.empty());
         fill.owe(5, {{30, 7}, {31, 7}, {32, 8}});   // one slot named twice in a batch: the first row fills it
@@ -620,13 +648,14 @@ int main() {
         got = fill.next(4, 0, all, resident, taken, nopick);
         CHECK(got.empty() && fill.owed(4) == 1);
         CHECK(fill.next(4, 1, all, resident, taken, nopick).size() == 1 && fill.empty());
-        // a row resident again gives its slot to the row the engine picks; a pick that is resident or in the batch
-        // already is not taken, and the slot is owed no more
+        // a row resident again gives its slot to the row the engine picks; a pick in the batch already is asked
+        // again, a pick that is resident ends the asking and the slot is owed no more
         fill.owe(6, {{12, 3}, {40, 9}, {12, 10}, {12, 11}});
         int picks = 0;
         auto pick = [&](int32_t row) -> int64_t { ++picks; return row == 12 ? (picks == 1 ? 17 : picks == 2 ? 40 : 12) : -1; };
         got = fill.next(6, 10, all, resident, taken, pick);
-        CHECK((got == std::vector<LendRefill::Row>{{17, 3}, {40, 9}}) && picks == 3 && fill.owed(6) == 0 && fill.empty());
+        CHECK((got == std::vector<LendRefill::Row>{{17, 3}, {40, 9}}) && picks == 4 && fill.owed(6) == 0 && fill.empty());
+        CHECK(fill.lost(6).no_pick == 2 && fill.lost(6).taken == 0);
     }
 
     std::printf("vram_lend_test: all checks passed\n");
