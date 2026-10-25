@@ -492,6 +492,143 @@ int main() {
         CHECK(!called);
     }
 
+    // ---- a return maps its lease's segments back through the engine's give hook, all or none; two leases on one card
+    // come back in either order, and the experts of a slot that straddles both wait until both are back
+    for (int order = 0; order < 2; ++order) {
+        using SLC = SegmentLendCache<FakeSegCache>;
+        using strata::core::LendRefill;
+        using strata::core::SegmentLease;
+        // 100 slots of 7 MiB, 64 MiB segments: a 10-slot floor and a 20-slot loan leave the band [2, 8); slot order is
+        // rank order, so a lease takes the band's last segments
+        FakeSegCache c(100, 7 * M, 64 * (int64_t) M);
+        SLC lc;
+        const SLC::Card k = lc.add(0, c, 10, 20);
+        CHECK(k.band.first == 2 && k.band.end == 8);
+        std::vector<int64_t> ranks(100);
+        for (int64_t s = 0; s < 100; ++s) ranks[(size_t) s] = s;
+        lc.set_ranks([&](const SLC::Card&) { return ranks; });
+        std::vector<uint8_t> out(100, 0);   // the slots whose expert a lease took out (row = 1000 + slot)
+        lc.set_take([&](const SLC::Card&, SegmentLease& l, const std::vector<std::pair<int64_t, double>>&) {
+            for (int64_t sg : l.segs) {
+                c.mapped[(size_t) sg] = false;
+                int64_t lo = 0, hi = 0;
+                c.segment_slots(sg, lo, hi);
+                for (int64_t s = lo; s < hi; ++s)
+                    if (!out[(size_t) s]) {
+                        out[(size_t) s] = 1;
+                        l.evicted.push_back({(int32_t) (1000 + s), (int32_t) s});
+                    }
+            }
+            return true;
+        });
+        LendCommands d(lc);
+        const std::string start = "LENDABLE dev=0 lendable=384 lent=0\nEND\n";
+        CHECK_REPLY(d, "LENDABLE", start);
+        std::string r;
+        CHECK(d.handle("LEND 0 128", r) && lent_id(r, 0, 128) != 0);
+        const uint64_t a = lent_id(r, 0, 128);
+        CHECK(d.handle("LEND 0 128", r) && lent_id(r, 0, 128) != 0);
+        const uint64_t b = lent_id(r, 0, 128);
+        std::vector<int64_t> segs_a, segs_b;
+        std::vector<LendRefill::Row> rows_a, rows_b;
+        for (const auto& kv : lc.leases()) {
+            (kv.second.segs.front() == 6 ? segs_a : segs_b) = kv.second.segs;
+            (kv.second.segs.front() == 6 ? rows_a : rows_b) = kv.second.evicted;
+        }
+        CHECK((segs_a == std::vector<int64_t>{6, 7}) && (segs_b == std::vector<int64_t>{4, 5}));
+        // slot 54 (378..385 MiB) straddles segment 5 (lease B) and 6 (lease A): lease A took its expert, B did not
+        CHECK(rows_a.front() == LendRefill::Row(1054, 54) && rows_a.size() == 20);
+        CHECK(rows_b.front() == LendRefill::Row(1036, 36) && rows_b.back() == LendRefill::Row(1053, 53));
+        CHECK_REPLY(d, "LENDABLE", "LENDABLE dev=0 lendable=128 lent=256\nEND\n");
+        // no give hook: every return is busy and nothing changes
+        CHECK_REPLY(d, "RETURN " + std::to_string(a), "ERR BUSY " + std::to_string(a) + "\n");
+        CHECK(d.open_leases() == 2 && lc.leases().size() == 2);
+        // the hook: another program holds the memory (busy, nothing mapped), or every segment is mapped back
+        bool held = false;
+        std::vector<std::vector<int64_t>> given;
+        lc.set_give([&](const SLC::Card& cc, SegmentLease& l) {
+            if (cc.dev != 0 || held) return GiveBack::busy;
+            for (int64_t sg : l.segs) c.mapped[(size_t) sg] = true;
+            given.push_back(l.segs);
+            return GiveBack::returned;
+        });
+        held = true;
+        CHECK_REPLY(d, "RETURN " + std::to_string(b), "ERR BUSY " + std::to_string(b) + "\n");
+        CHECK(d.open_leases() == 2 && lc.leases().size() == 2 && given.empty());
+        CHECK_REPLY(d, "LENDABLE", "LENDABLE dev=0 lendable=128 lent=256\nEND\n");
+        held = false;
+        // what the returns owe the cache, and the slot test: usable when every segment it touches is mapped
+        LendRefill fill;
+        auto usable = [&](int32_t s) {
+            const int64_t a0 = (int64_t) c.slot_offset(s), a1 = (int64_t) c.slot_offset(s + 1) - 1;
+            return c.segment_mapped(a0 / c.seg) && c.segment_mapped(a1 / c.seg);
+        };
+        auto no = [](int32_t) { return false; };
+        auto nopick = [](int32_t) -> int64_t { return -1; };
+        const uint64_t first = order == 0 ? a : b, second = order == 0 ? b : a;
+        const std::vector<LendRefill::Row>& rows_first = order == 0 ? rows_a : rows_b;
+        const std::vector<LendRefill::Row>& rows_second = order == 0 ? rows_b : rows_a;
+        CHECK_REPLY(d, "RETURN " + std::to_string(first), "RETURNED " + std::to_string(first) + "\n");
+        CHECK(d.open_leases() == 1 && lc.leases().size() == 1);
+        CHECK(given.size() == 1 && given[0] == (order == 0 ? segs_a : segs_b));
+        CHECK_REPLY(d, "LENDABLE", "LENDABLE dev=0 lendable=256 lent=128\nEND\n");
+        CHECK_REPLY(d, "RETURN " + std::to_string(first), "ERR UNKNOWN " + std::to_string(first) + "\n");
+        fill.owe(0, rows_first);
+        std::vector<LendRefill::Row> got = fill.next(0, 1000, usable, no, no, nopick);
+        if (order == 0) {   // slot 54 still touches lease B's segment 5: its expert waits
+            CHECK(got.size() == 19 && got.front() == LendRefill::Row(1055, 55) && fill.owed(0) == 1);
+        } else {            // every slot lease B took is whole again
+            CHECK(got == rows_b && fill.owed(0) == 0 && fill.empty());
+        }
+        CHECK_REPLY(d, "RETURN " + std::to_string(second), "RETURNED " + std::to_string(second) + "\n");
+        CHECK(d.open_leases() == 0 && lc.leases().empty() && given.size() == 2);
+        CHECK_REPLY(d, "LENDABLE", start);
+        fill.owe(0, rows_second);
+        got = fill.next(0, 1000, usable, no, no, nopick);
+        if (order == 0) {   // slot 54 comes back with lease B's slots
+            CHECK(got.size() == 19 && got.front() == LendRefill::Row(1054, 54) && got[1] == LendRefill::Row(1036, 36));
+        } else {
+            CHECK(got == rows_a);
+        }
+        CHECK(fill.empty() && fill.owed(0) == 0);
+    }
+    // ---- the refill's batches: in the order owed, up to the batch size; a row resident again or whose slot another
+    // expert holds is owed no more; a slot named twice is filled once
+    {
+        using strata::core::LendRefill;
+        LendRefill fill;
+        auto nopick = [](int32_t) -> int64_t { return -1; };
+        CHECK(fill.empty() && fill.next(3, 10, [](int32_t) { return true; }, [](int32_t) { return false; },
+                                        [](int32_t) { return false; }, nopick).empty());
+        fill.owe(3, {{10, 1}, {11, 2}, {12, 3}, {13, 4}, {14, 5}, {15, 2}, {16, 6}});
+        fill.owe(4, {{20, 1}});
+        CHECK(fill.owed(3) == 7 && fill.owed(4) == 1 && fill.owed(5) == 0);
+        auto all = [](int32_t) { return true; };
+        auto resident = [](int32_t row) { return row == 12; };   // brought back by the adaptive tier
+        auto taken = [](int32_t slot) { return slot == 4; };      // another expert's slot now
+        std::vector<LendRefill::Row> got = fill.next(3, 2, all, resident, taken, nopick);
+        CHECK((got == std::vector<LendRefill::Row>{{10, 1}, {11, 2}}) && fill.owed(3) == 5);
+        auto landed = [](int32_t slot) { return slot == 4 || slot == 2; };   // and 11's copy has landed in slot 2
+        got = fill.next(3, 10, [](int32_t s) { return s != 6; }, resident, landed, nopick);
+        // 12 resident (no other row wanted), 13's and 15's slots taken: out; 16's slot is not usable: it stays
+        CHECK((got == std::vector<LendRefill::Row>{{14, 5}}) && fill.owed(3) == 1);
+        got = fill.next(3, 10, all, resident, taken, nopick);
+        CHECK((got == std::vector<LendRefill::Row>{{16, 6}}) && fill.owed(3) == 0 && !fill.empty());
+        fill.owe(5, {{30, 7}, {31, 7}, {32, 8}});   // one slot named twice in a batch: the first row fills it
+        CHECK((fill.next(5, 10, all, resident, taken, nopick) == std::vector<LendRefill::Row>{{30, 7}, {32, 8}}) &&
+              fill.owed(5) == 0);
+        got = fill.next(4, 0, all, resident, taken, nopick);
+        CHECK(got.empty() && fill.owed(4) == 1);
+        CHECK(fill.next(4, 1, all, resident, taken, nopick).size() == 1 && fill.empty());
+        // a row resident again gives its slot to the row the engine picks; a pick that is resident or in the batch
+        // already is not taken, and the slot is owed no more
+        fill.owe(6, {{12, 3}, {40, 9}, {12, 10}, {12, 11}});
+        int picks = 0;
+        auto pick = [&](int32_t row) -> int64_t { ++picks; return row == 12 ? (picks == 1 ? 17 : picks == 2 ? 40 : 12) : -1; };
+        got = fill.next(6, 10, all, resident, taken, pick);
+        CHECK((got == std::vector<LendRefill::Row>{{17, 3}, {40, 9}}) && picks == 3 && fill.owed(6) == 0 && fill.empty());
+    }
+
     std::printf("vram_lend_test: all checks passed\n");
     return 0;
 }
