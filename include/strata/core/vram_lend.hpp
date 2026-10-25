@@ -133,7 +133,9 @@ inline LendBand lend_band(std::uint64_t floor_end, std::uint64_t loan_start, std
 /// slots are the ones the cache misses least), rounded up to whole segments, through the engine's take hook - which
 /// evicts the slots that touch them, quiets the devices and unmaps them - and keeps them as a SegmentLease under the
 /// token LendCommands gets back.  Without a take hook nothing can be taken: every lend is refused with nothing
-/// lendable now (ERR MAX 0).  give_back() has nothing to give back yet (busy).
+/// lendable now (ERR MAX 0).  A return gives a lease's segments back through the engine's give hook, which maps
+/// them all or none (busy: another program still holds the memory, nothing changed and the lease stays open); without
+/// one every return is busy.
 template <class Cache>
 class SegmentLendCache : public LendCache {
 public:
@@ -254,7 +256,22 @@ public:
         leases_.emplace(r.token, std::move(lease));
         return r;
     }
-    GiveBack give_back(int, std::uint64_t) override { return GiveBack::busy; }
+    /// The engine's part of a return: map the segments of `lease` (a lease of card `c`) back, all or none.  `returned`:
+    /// they are mapped (their slots empty until the engine fills them) and the lease ends; `busy`: none is mapped, the
+    /// cache is as before and the lease stays open.
+    using GiveFn = std::function<GiveBack(const Card& c, SegmentLease& lease)>;
+    void set_give(GiveFn f) { give_ = std::move(f); }
+
+    GiveBack give_back(int dev, std::uint64_t token) override {
+        const auto it = leases_.find(token);
+        if (it == leases_.end() || it->second.dev != dev || !give_) return GiveBack::busy;
+        const Card* c = nullptr;
+        for (const Card& k : cards_)
+            if (k.dev == dev) c = &k;
+        if (c == nullptr || give_(*c, it->second) != GiveBack::returned) return GiveBack::busy;
+        leases_.erase(it);
+        return GiveBack::returned;
+    }
 
     /// The open leases, by the token lend() handed out.
     const std::map<std::uint64_t, SegmentLease>& leases() const { return leases_; }
@@ -277,8 +294,73 @@ private:
     std::vector<Card> cards_;
     TakeFn take_;
     RanksFn ranks_;
+    GiveFn give_;
     std::uint64_t next_token_ = 1;
     std::map<std::uint64_t, SegmentLease> leases_;
+};
+
+/// What the returned leases still owe each card's cache: (residency row, slot) of the experts they evicted.  A return
+/// maps its segments and answers at once; the experts go back into their slots afterwards, a batch at a time, from
+/// copies queued outside any answer (a return that copied them back first would stop the decode for the copy).  A
+/// slot that also touches a segment another lease still holds (it straddles the edge between two leases) is not
+/// usable until that lease is back too: its row waits here.
+class LendRefill {
+public:
+    using Row = std::pair<std::int32_t, std::int32_t>;   // (residency row, slot)
+    /// Card `dev` owes `rows` (a returned lease's evicted experts, or a batch that could not land).
+    void owe(int dev, const std::vector<Row>& rows) {
+        if (rows.empty()) return;
+        auto& v = owed_[dev];
+        v.insert(v.end(), rows.begin(), rows.end());
+    }
+    std::size_t owed(int dev) const {
+        const auto it = owed_.find(dev);
+        return it == owed_.end() ? 0 : it->second.size();
+    }
+    bool empty() const {
+        for (const auto& kv : owed_)
+            if (!kv.second.empty()) return false;
+        return true;
+    }
+    /// The next batch for card `dev`: up to `max_rows` owed rows whose slot is usable now (`usable(slot)`), taken out of
+    /// the list in the order they were owed.  A row that is resident again (`resident(row)`: the adaptive tier brought
+    /// it back into another slot) gives its slot to `pick(row)` instead, the row the engine wants there most (-1: none;
+    /// a pick that is resident or already in the batch is not taken).  A row whose slot another expert holds now
+    /// (`taken(slot)`, or a row before it in the batch) is owed no more and leaves the list; a row whose slot is not
+    /// usable stays.
+    template <class Usable, class Resident, class Taken, class Pick>
+    std::vector<Row> next(int dev, std::size_t max_rows, Usable&& usable, Resident&& resident, Taken&& taken,
+                          Pick&& pick) {
+        std::vector<Row> out;
+        const auto it = owed_.find(dev);
+        if (it == owed_.end()) return out;
+        std::vector<Row> keep;
+        auto in_batch = [&](const Row& r) {
+            for (const Row& o : out)
+                if (o.first == r.first || o.second == r.second) return true;
+            return false;
+        };
+        for (const Row& r : it->second) {
+            if (out.size() >= max_rows || !usable(r.second)) {
+                keep.push_back(r);
+                continue;
+            }
+            if (taken(r.second)) continue;
+            Row f = r;
+            if (resident(r.first)) {
+                const std::int64_t p = pick(r.first);
+                if (p < 0 || resident((std::int32_t) p)) continue;
+                f.first = (std::int32_t) p;
+            }
+            if (in_batch(f)) continue;
+            out.push_back(f);
+        }
+        it->second.swap(keep);
+        return out;
+    }
+
+private:
+    std::map<int, std::vector<Row>> owed_;
 };
 
 /// What a control line is to the lend commands, by its first word (split on blanks as LendCommands::handle splits it):

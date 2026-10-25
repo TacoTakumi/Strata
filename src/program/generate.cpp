@@ -12330,8 +12330,12 @@ int main(int argc, char** argv) {
             for (const auto& st : stages) no_lend->add(st->dev, unsegmented, 0, 0);
             lends = std::make_unique<strata::core::LendCommands>(*no_lend);
         }
-        // what the last lease took, for its log line once its id is known (the lend's take hook fills it)
+        // what the last lease took or gave back, for its log line once its id is known (the lend hooks fill it)
         std::string lend_note;
+        // the background refill after a return (set where the lend hooks are): one step, called where nothing is in
+        // flight while `lend_refilling` (rows owed or copies in flight)
+        std::function<void()> lend_refill_tick;
+        bool lend_refilling = false;
         // a lend command's answer: whole lines from the main thread between two steps, never inside a request's lines
         auto lend_reply = [&](const std::string& l) {
             std::string reply;
@@ -12340,8 +12344,13 @@ int main(int argc, char** argv) {
             std::fputs(reply.c_str(), stdout);
             std::fflush(stdout);
             unsigned long long id = 0;
-            if (!lend_note.empty() && std::sscanf(reply.c_str(), "LENT %llu", &id) == 1)
+            if (!lend_note.empty() && (std::sscanf(reply.c_str(), "LENT %llu", &id) == 1 ||
+                                       std::sscanf(reply.c_str(), "RETURNED %llu", &id) == 1))
                 std::fprintf(stderr, "strata serve: VRAM Lend: lease %llu %s\n", id, lend_note.c_str());
+            // a LEND or RETURN is answered where nothing is in flight: the refill moves on here too
+            if (lend_refilling && lend_refill_tick &&
+                strata::core::lend_line_kind(l) == strata::core::LendLineKind::change)
+                lend_refill_tick();
         };
         // every waiting lend command, in the order they came: when idle, and at the end of each decode window
         auto serve_lends = [&] {
@@ -12718,6 +12727,203 @@ int main(int argc, char** argv) {
         auto lend_owns = [&](size_t i, size_t idx) {
             return (stages.empty() ? (size_t) 0 : (size_t) stage_of((int64_t) i / g.n_expert)) == idx;
         };
+        // A return maps its segments and answers; it copies nothing.  The experts its lease evicted are owed to their
+        // slots (lend_owed) and go back a batch at a time from the stream's window ends (lend_refill_tick): each batch
+        // is queued on the card's own copy stream, and its rows enter the residency table at a later window end, once
+        // the batch has landed.  Nothing reads a slot no row names, so the copies run beside the windows.  A row that
+        // is resident again (the adaptive tier) gives its slot to another expert of its layer; a row whose slot another
+        // expert holds is owed no more; a slot that is not usable (it touches another lease's hole, or a shrink took
+        // it) keeps its row owed.  While a prompt holds its loan nothing is queued.  A lend first lands the batch in
+        // flight (lend_refill_drain).
+        struct LendFill {   // per target (vram_targets' idx): the batch in flight on its copy stream
+            int dev = 0;
+            cudaStream_t stream = nullptr;
+            cudaEvent_t ev = nullptr;
+            std::vector<strata::core::LendRefill::Row> flying;
+            int64_t owed = 0, back = 0, batches = 0;   // since the first row was owed
+            Clock::time_point since{};
+        };
+        struct LendFills {
+            std::vector<LendFill> v;
+            ~LendFills() {
+                for (LendFill& f : v) {
+                    const strata::core::OnDevice on(f.dev == 0 ? -1 : f.dev);
+                    if (f.ev != nullptr) {
+                        cudaEventSynchronize(f.ev);
+                        cudaEventDestroy(f.ev);
+                    }
+                    if (f.stream != nullptr) cudaStreamDestroy(f.stream);
+                }
+            }
+        } lend_fills;
+        strata::core::LendRefill lend_owed;
+        constexpr int64_t kLendRefillBatchBytes = 256ll << 20;   // per card and batch (a pageable source blocks the host)
+        int64_t lend_blob_max = 1;
+        if (lend_cache != nullptr) {
+            lend_fills.v.resize(vram_targets().size());
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                lend_blob_max = std::max<int64_t>(lend_blob_max,
+                                                  (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+        }
+        auto lend_loan_at = [&](const VramTarget& t) {   // the first slot a prompt's loan may take on t's cache now
+            for (const LendCards::Card& c : lend_cache->cards())
+                if (c.cache == t.cache) return LendCards::loan_start(c);
+            return t.cache->slots();
+        };
+        // the slots of t's cache an expert holds now or will hold when a copy in flight lands (the adaptive tier's)
+        auto lend_taken = [&](const VramTarget& t) {
+            std::vector<uint8_t> k((size_t) std::max<int64_t>(t.cache->full_slots(), 0), 0);
+            auto mark = [&](int32_t s) { if (s >= 0 && s < (int32_t) k.size()) k[(size_t) s] = 1; };
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] >= 0 && lend_owns(i, t.idx)) mark(host_res[i]);
+            for (const auto& [i, s] : pending)
+                if (lend_owns((size_t) i, t.idx)) mark(s);
+            for (const ASwap& w : aswaps)
+                if (lend_owns((size_t) w.layer * g.n_expert + w.in, t.idx)) mark(w.slot);
+            for (const PfPart& p : pf_parts)
+                if (p.cache == t.cache)
+                    for (const auto& pr : p.lent) mark(pr.second);
+            return k;
+        };
+        // row i is in VRAM, or will be when a copy in flight lands
+        auto lend_resident = [&](int32_t i) {
+            if (host_res[(size_t) i] >= 0) return true;
+            for (const auto& pr : pending)
+                if (pr.first == i) return true;
+            for (const ASwap& w : aswaps)
+                if ((int64_t) w.layer * g.n_expert + w.in == i) return true;
+            return false;
+        };
+        // t's batch in flight has landed (`wait`: wait for it): its rows enter the host table; true when one did
+        auto lend_land = [&](const VramTarget& t, bool wait) -> bool {
+            LendFill& f = lend_fills.v[t.idx];
+            if (f.flying.empty()) return false;
+            const strata::core::OnDevice on(t.dev == 0 ? -1 : t.dev);
+            const cudaError_t q = wait ? cudaEventSynchronize(f.ev) : cudaEventQuery(f.ev);
+            if (q == cudaErrorNotReady) return false;
+            std::vector<strata::core::LendRefill::Row> again;
+            int64_t in = 0;
+            if (q != cudaSuccess) {   // the slots' bytes are unknown: every row stays owed
+                std::fprintf(stderr, "strata serve: VRAM Lend: GPU %d: a refill of %zu experts failed: %s\n", t.dev,
+                             f.flying.size(), cudaGetErrorString(q));
+                (void) cudaGetLastError();
+                again.swap(f.flying);
+            } else {
+                const strata::core::ExpertCache& xc = *t.cache;
+                const int64_t loan_at = lend_loan_at(t);
+                std::vector<uint8_t> taken = lend_taken(t);
+                for (const auto& [i, s] : f.flying) {
+                    if (!xc.slot_usable(s) || s >= loan_at) { again.emplace_back(i, s); continue; }
+                    if (taken[(size_t) s]) continue;                              // the slot is used
+                    if (lend_resident(i)) { again.emplace_back(i, s); continue; }  // brought back meanwhile: a pick
+                    host_res[(size_t) i] = s;
+                    taken[(size_t) s] = 1;
+                    ++in;
+                }
+                f.flying.clear();
+            }
+            lend_owed.owe(t.dev, again);
+            f.back += in;
+            return in > 0;
+        };
+        // queue t's next batch, when none is in flight
+        auto lend_queue = [&](const VramTarget& t) {
+            LendFill& f = lend_fills.v[t.idx];
+            if (!f.flying.empty() || lend_owed.owed(t.dev) == 0) return;
+            strata::core::ExpertCache& xc = *t.cache;
+            const strata::core::OnDevice on(t.dev == 0 ? -1 : t.dev);
+            f.dev = t.dev;
+            if (f.stream == nullptr && cudaStreamCreateWithFlags(&f.stream, cudaStreamNonBlocking) != cudaSuccess) {
+                f.stream = nullptr;
+                (void) cudaGetLastError();
+                return;
+            }
+            if (f.ev == nullptr && cudaEventCreateWithFlags(&f.ev, cudaEventDisableTiming) != cudaSuccess) {
+                f.ev = nullptr;
+                (void) cudaGetLastError();
+                return;
+            }
+            const int64_t loan_at = lend_loan_at(t);
+            const std::vector<uint8_t> taken = lend_taken(t);
+            // a row the adaptive tier brought back gives its slot to the layer's most-routed miss (the profile's
+            // hottest without routing counts), as the VRAM command's grow does: a slot of a layer keeps that layer
+            std::vector<uint8_t> picked(host_res.size(), 0);   // this batch's picks: each row once
+            auto pick = [&](int32_t i) -> int64_t {
+                const int64_t layer = i / g.n_expert;
+                int64_t best = -1;
+                for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                    const int32_t j = (int32_t) (layer * g.n_expert + ex);
+                    if (picked[(size_t) j] || lend_resident(j)) continue;
+                    const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) j];
+                    const float ub = best < 0 || drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) best];
+                    if (best < 0 || u > ub || (u == ub && lend_rank[(size_t) j] < lend_rank[(size_t) best])) best = j;
+                }
+                if (best >= 0) picked[(size_t) best] = 1;
+                return best;
+            };
+            std::vector<strata::core::LendRefill::Row> batch = lend_owed.next(
+                t.dev, (size_t) std::max<int64_t>(1, kLendRefillBatchBytes / lend_blob_max),
+                [&](int32_t s) { return xc.slot_usable(s) && s < loan_at; }, lend_resident,
+                [&](int32_t s) { return taken[(size_t) s] != 0; }, pick);
+            for (size_t k = 0; k < batch.size(); ++k) {
+                const auto [i, s] = batch[k];
+                const int64_t layer = i / g.n_expert;
+                const uint8_t* b = srcp->blob_stable(layer, i % g.n_expert);
+                const cudaError_t e = b == nullptr ? cudaErrorInvalidValue
+                    : cudaMemcpyAsync(xc.device_slot(s), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer),
+                                      cudaMemcpyHostToDevice, f.stream);
+                if (e != cudaSuccess) {   // the rest stay owed; what was queued lands as usual
+                    std::fprintf(stderr, "strata serve: VRAM Lend: GPU %d: queueing a refill of layer %lld expert %lld "
+                                         "failed: %s\n", t.dev, (long long) layer, (long long) (i % g.n_expert),
+                                 b == nullptr ? "the expert could not be read" : cudaGetErrorString(e));
+                    (void) cudaGetLastError();
+                    lend_owed.owe(t.dev, std::vector<strata::core::LendRefill::Row>(batch.begin() + (ptrdiff_t) k, batch.end()));
+                    batch.resize(k);
+                    break;
+                }
+                srcp->note_async_read(b, f.stream);   // #1237
+            }
+            if (batch.empty()) return;
+            if (cudaEventRecord(f.ev, f.stream) != cudaSuccess) {   // nothing to wait on: wait for the stream now
+                (void) cudaGetLastError();
+                cudaStreamSynchronize(f.stream);
+            }
+            (void) cudaStreamQuery(f.stream);   // submitted now (WDDM)
+            f.flying = std::move(batch);
+            ++f.batches;
+        };
+        // where nothing is in flight on any card: the batches that landed go in the table, the next ones are queued
+        // (`wait`, before a lend: only the batches in flight land, and nothing new is queued)
+        auto lend_refill_step = [&](bool wait) {
+            if (!wait)
+                for (const PfPart& p : pf_parts)
+                    if (!p.lent.empty()) return;   // a prompt holds its loan: the refill waits for the decode
+            bool in = false;
+            const std::vector<VramTarget> targets = vram_targets();
+            for (const VramTarget& t : targets) in = lend_land(t, wait) || in;
+            if (in) {
+                if (const cudaError_t ur = res_upload(); ur != cudaSuccess)
+                    std::fprintf(stderr, "strata serve: VRAM Lend: the residency table upload after a refill failed: %s\n",
+                                 cudaGetErrorString(ur));
+            }
+            lend_refilling = false;
+            for (const VramTarget& t : targets) {
+                if (!wait) lend_queue(t);
+                LendFill& f = lend_fills.v[t.idx];
+                const bool busy = !f.flying.empty() || lend_owed.owed(t.dev) > 0;
+                lend_refilling = lend_refilling || busy;
+                if (!busy && f.batches > 0) {
+                    std::fprintf(stderr, "strata serve: VRAM Lend: GPU %d: the returned slots are filled again: %lld "
+                                         "slots of %lld owed (the rest: another expert held the slot, or no "
+                                         "expert of its layer was left out of VRAM) in %lld batches, %.0f ms after the first return\n", t.dev,
+                                 (long long) f.back, (long long) f.owed, (long long) f.batches,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - f.since).count());
+                    f.owed = f.back = f.batches = 0;
+                }
+            }
+        };
+        auto lend_refill_drain = [&] { if (lend_refilling) lend_refill_step(true); };
+        if (lend_cache != nullptr) lend_refill_tick = [&] { lend_refill_step(false); };
         if (lend_cache != nullptr) {
             lend_cache->set_ranks([&](const LendCards::Card& c) {
                 std::vector<int64_t> r((size_t) std::max<int64_t>(c.cache->slots(), 0), lend_past);
@@ -12746,6 +12952,7 @@ int main(int argc, char** argv) {
                 for (auto& st : stages)
                     if (!st->ver.wait_commit(e)) return fail(e);
                 adapt_quiesce();
+                lend_refill_drain();   // a return's refill in flight lands first: its rows are in the table to evict
                 const auto t1 = Clock::now();
                 // 2. the slots out of the tables
                 const int64_t n = xc.slots();
@@ -12868,6 +13075,45 @@ int main(int argc, char** argv) {
                               (long long) (free_b >> 20));
                 lend_note = buf;
                 return true;
+            });
+            // RETURN: the lease's segments are mapped back all or none - when the driver cannot back one (another
+            // program holds the memory) none is, and the answer is busy with the lease open and nothing changed.  The
+            // slots are empty then: the lease's experts are owed to them and the refill above brings them back from
+            // the window ends.  No table changes and nothing is copied before the answer.
+            lend_cache->set_give([&](const LendCards::Card& c, strata::core::SegmentLease& lease) {
+                const auto t0 = Clock::now();
+                VramTarget t{};
+                if (!lend_target(c.cache, t)) return strata::core::GiveBack::busy;
+                strata::core::ExpertCache& xc = *t.cache;
+                const strata::core::OnDevice on(t.dev == 0 ? -1 : t.dev);
+                std::string e;
+                const strata::core::ExpertCache::MapResult r = xc.map_segments(lease.segs, e);
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                if (r != strata::core::ExpertCache::MapResult::ok) {
+                    std::fprintf(stderr, "strata serve: VRAM Lend: a return of %zu segments on GPU %d is %s: %s (%.1f ms)\n",
+                                 lease.segs.size(), t.dev,
+                                 r == strata::core::ExpertCache::MapResult::busy
+                                     ? "busy, nothing changed (another program holds the memory)" : "refused", e.c_str(), ms);
+                    return strata::core::GiveBack::busy;
+                }
+                LendFill& f = lend_fills.v[t.idx];
+                if (f.batches == 0 && f.flying.empty() && lend_owed.owed(t.dev) == 0) f.since = Clock::now();
+                lend_owed.owe(t.dev, lease.evicted);
+                f.owed += (int64_t) lease.evicted.size();
+                lend_refilling = true;
+                std::string list;
+                for (const int64_t sg : lease.segs) list += (list.empty() ? "" : " ") + std::to_string(sg);
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                char buf[512];
+                std::snprintf(buf, sizeof buf,
+                              "back on GPU %d: %zu segments of %.0f MiB [%s] mapped in %.1f ms; %zu experts to refill "
+                              "from the window ends (%zu owed on this GPU: a slot that touches another lease waits for "
+                              "it), %lld MiB free now",
+                              t.dev, lease.segs.size(), (double) xc.segment_bytes() / 1048576.0, list.c_str(), ms,
+                              lease.evicted.size(), lend_owed.owed(t.dev), (long long) (free_b >> 20));
+                lend_note = buf;
+                return strata::core::GiveBack::returned;
             });
         }
 #endif
@@ -17288,8 +17534,10 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
                 // VRAM Lend: the lend commands that came during the window, at its end - its tokens are out, the
-                // draft for the next one ran and the adaptive tier joined (one atomic load when none waits)
+                // draft for the next one ran and the adaptive tier joined (one atomic load when none waits); then the
+                // refill after a return moves on
                 if (lend_q != nullptr && lend_q->waiting()) serve_lends();
+                if (lend_refilling) lend_refill_tick();
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
