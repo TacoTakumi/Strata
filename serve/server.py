@@ -66,6 +66,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
+from serve import gpu_map, vram_lend  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
 
@@ -1177,6 +1178,10 @@ class StrataEngine:
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
         self.silent_note = None
         self.last_err = None
+        # VRAM Lend (opt-in, the config's "vram_lend": true): the /vram routes' lend commands (serve/vram_lend.py)
+        self.lending = "--vram-lend" in args
+        self.lend_gpus: list[dict] = []  # the engine's GPU-PCI lines at load: its GPU numbers and PCI addresses
+        self._lend_calls = None          # the lend commands sent and not answered yet (this process's)
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -1245,6 +1250,10 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith(gpu_map.LINE):
+                part = gpu_map.parse(line)
+                if part:
+                    self.lend_gpus.append(part)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -1393,6 +1402,8 @@ class StrataEngine:
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
+        if self.lending:                                # the lend commands of this process: a restart makes new ones
+            self._lend_calls = vram_lend.Calls(lambda text, stdin=self.proc.stdin: self._lend_write(stdin, text))
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
@@ -1402,6 +1413,7 @@ class StrataEngine:
         slot_busy = self.slot_busy                      # this process's (a restart makes new ones)
         rid_q = self.rid_q
         multi = self.multi
+        lend_calls = self._lend_calls                   # (None without VRAM Lend: every line as before)
         line = None
         for line in proc.stdout:
             # checked before batch routing: a fatal line is never a slot's own
@@ -1416,6 +1428,9 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            if lend_calls is not None and vram_lend.is_answer(line):
+                lend_calls.answer(line)         # a lend answer (they come while requests run): never a request's line
+                continue
             if line.startswith("BSTAT"):
                 sample = parse_batch_window_sample(line)
                 if sample is not None and self.proc is proc:
@@ -1453,13 +1468,16 @@ class StrataEngine:
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
-            if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
+            if line and line.startswith("ERR") and not (lend_calls is not None and vram_lend.is_answer(line)):
+                # #997 #890: why it exited, though no request may read it (a lend answer is not that)
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
         for q in slot_q:
             q.put(None)
         for q in list(rid_q.values()):
             q.put(None)
+        if lend_calls is not None:                      # the lend commands still waiting get no answer now
+            lend_calls.close()
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -1674,6 +1692,34 @@ class StrataEngine:
         if self.split_engine or prompt_len <= orig_len:
             return ""
         return f" pen_from={orig_len - 1}"
+    def _lend_write(self, stdin, text: str):
+        with self.wlock:
+            stdin.write(text + "\n")
+            stdin.flush()
+
+    def lend_command(self, line: str, timeout: float = 30.0, then=None) -> list[str]:
+        """VRAM Lend: a lend command (LEND / RETURN / LENDABLE, serve/vram_lend.py) -> its answer lines, also while
+        requests run: the engine takes them between its steps, and the answers come back through their own table
+        (_pump), so neither the service's FIFO nor a request's lines are involved.  `then(lines, waited)` runs on the
+        line reader's thread as the answer comes (vram_lend.Calls).  ValueError when the engine does not answer in
+        `timeout`: the command stays sent, and its answer goes to `then` (waited False) when it comes - never to a
+        later command."""
+        calls = self._lend_calls
+        call = calls.send(line, then) if calls is not None else None
+        if call is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        if not calls.wait(call, timeout):
+            raise ValueError(f"the engine did not answer {line.split()[0]} in {timeout:g} s")
+        if call.got is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        return call.got
+
+    def lend_post(self, line: str, then):
+        """A lend command nobody waits for: its answer goes to `then(lines, False)` on the line reader's thread (not
+        at all when the engine ends first)."""
+        calls = self._lend_calls
+        if calls is None or calls.send(line, then, waited=False) is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -3880,6 +3926,10 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    # VRAM Lend (opt-in): "vram_lend": true - other programs borrow expert-cache VRAM through POST /vram/lend and
+    # give it back through POST /vram/return while requests run (serve/vram_lend.py)
+    if cfg.get("vram_lend") is True and "--vram-lend" not in args:
+        args.append("--vram-lend")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)
@@ -4828,6 +4878,7 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self.vram_lend = vram_lend.Lender()           # the /vram routes (VRAM Lend: the engine's GPU memory lent out)
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -8251,6 +8302,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/vram/state":                      # VRAM Lend: what each GPU can lend, and the open leases
+                if self._authorized():
+                    self._json(*svc.vram_lend.state(svc.engine))
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -8290,6 +8344,17 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 self._json(409 if r == "busy" else 200, {"status": r})
+                return
+            if path in ("/vram/lend", "/vram/return"):     # VRAM Lend: lend the engine's GPU memory, take it back -
+                if self._foreign_page():                     # not queued behind the requests (serve/vram_lend.py)
+                    return
+                try:
+                    req = json.loads(self._body() or b"{}")
+                except ValueError:
+                    self._json(400, {"error": "the request body must be a JSON object"})
+                    return
+                lender = svc.vram_lend
+                self._json(*(lender.lend if path == "/vram/lend" else lender.give_back)(svc.engine, req))
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
