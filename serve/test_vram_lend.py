@@ -6,6 +6,7 @@ way the engine does - also while a request runs.  The contract is VRAM Lend's ap
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -745,6 +746,28 @@ class OptionOnLinesWin(LendBase):
         self.assertEqual(smi, [])
 
 
+SYCL = {"args": ["--max-context", "8192"], "vram_lend": True, "backend": "sycl"}
+
+
+class IntelEngine(LendBase):
+    """The Intel engine (SYCL) has no VRAM Lend and refuses --vram-lend as an unknown argument (it ends at the start):
+    with "vram_lend": true it starts without the flag, and the /vram routes answer as for an engine that cannot lend.
+    nvidia-smi does not see Intel cards, so /vram/state lists none."""
+    with mock.patch("sys.stdout"):
+        args = engine_args(SYCL)
+
+    def test_501_and_no_gpus(self):
+        smi = fake_smi(self)
+        self.svc.backend, self.svc.engine_gpus = "sycl", [0]
+        self.assertFalse(self.engine.lending)
+        self.assertEqual(self.lend("0000:01:00.0", 64)[0], 501)
+        self.assertEqual(self.give_back("7")[0], 501)
+        self.assertEqual(self.state(), {"gpus": [], "leases": []})
+        self.assertEqual((smi, self.lend_lines()), ([], []))
+        self.assertEqual([t for t in self.engine.generate([1, 2], 2, {}, threading.Event()) if t is not None],
+                         [1001, 1002])
+
+
 class NoLendingEngine(unittest.TestCase):
     def test_mock_engine(self):
         tok = ByteTokenizer()
@@ -856,6 +879,27 @@ class ConfigKey(unittest.TestCase):
         self.assertEqual(engine_args({**cfg, "vram_lend": True}), ["--max-context", "8192", "--vram-lend"])
         self.assertEqual(engine_args({**cfg, "vram_lend": "yes"}), ["--max-context", "8192"])
         self.assertEqual(engine_args({"args": ["--vram-lend"], "vram_lend": True}), ["--vram-lend"])
+
+    def test_cuda_and_hip_get_the_flag(self):
+        # the HIP engine takes the flag and reports nothing lendable by itself
+        for backend in ("cuda", "hip"):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                args = engine_args({"args": [], "vram_lend": True, "backend": backend})
+            self.assertEqual(args, ["--vram-lend"], backend)
+            self.assertNotIn("VRAM Lend", out.getvalue())
+
+    def test_intel_engine_starts_without_the_flag(self):
+        for cfg in (SYCL, {"args": ["--max-context", "8192"], "vram_lend": True, "exe": "/opt/s/sycl/serve/strata-sycl.sh"},
+                    {**SYCL, "args": ["--max-context", "8192", "--vram-lend"]}):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                args = engine_args(cfg)
+            self.assertEqual(args, ["--max-context", "8192"], cfg)
+            said = [x for x in out.getvalue().splitlines() if "VRAM Lend" in x]
+            self.assertEqual(len(said), 1, out.getvalue())
+            self.assertIn("Intel", said[0])
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:      # option off: nothing said
+            self.assertEqual(engine_args({**SYCL, "vram_lend": False}), ["--max-context", "8192"])
+        self.assertEqual(out.getvalue(), "")
 
     def test_the_key_is_editable(self):
         cfg = {"args": ["--max-context", "8192"]}
