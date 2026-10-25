@@ -690,6 +690,10 @@ struct Options {
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
+    /// VRAM Lend (opt-in): other programs borrow expert-cache VRAM while requests run.  Every card's cache is in
+    /// segments as with --vram-elastic (a lease is whole segments), decode runs the serial loop, and the engine names
+    /// each card's PCI address before READY.  It does not turn on the VRAM command: that stays --vram-elastic's.
+    bool vram_lend = false;
     /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
     /// A card that drives no display needs less than the one the monitors are on.
     int vram_reserve_later_mib = -1;
@@ -987,6 +991,10 @@ void usage() {
                  "                       /v1/vram) can give VRAM back to other programs between requests and take it back\n"
                  "                       later; with a layer split every GPU has its own cache and `device` (0 = the main\n"
                  "                       card) picks which one moves\n"
+                 "  --vram-lend          --serve (opt-in, NVIDIA): VRAM Lend - other programs borrow expert-cache VRAM\n"
+                 "                       while requests run (the server's POST /vram/lend, /vram/return); every GPU's cache\n"
+                 "                       in segments (--vram-segment-mib), the serial decode loop (no --pipeline-windows,\n"
+                 "                       no --batch), and one `GPU-PCI dev=<n> pci=<address>` line per GPU before READY\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
@@ -3145,6 +3153,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
+        else if (a == "--vram-lend") o.vram_lend = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
@@ -3334,6 +3343,30 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+        }
+    }
+    // VRAM Lend: a lend or a return is answered where nothing is in flight - when idle, after a decode window, between
+    // prompt chunks.  The pipelined windows and the batch slots have no such point mid-stream, so both are off with it.
+    if (o.vram_lend) {
+        const char* why = !o.serve ? "it works while requests of --serve run"
+                        : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                      [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
+                        : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
+#if defined(STRATA_USE_HIP)
+        if (why == nullptr) why = "it is NVIDIA-only for now";
+#endif
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --vram-lend is off: %s\n", why);
+            o.vram_lend = false;
+        } else {
+            if (o.pipeline_windows > 0)
+                std::fprintf(stderr, "strata generate: --pipeline-windows %d is off: VRAM Lend (--vram-lend) runs the serial "
+                                     "decode loop\n", o.pipeline_windows);
+            o.pipeline_windows = 0;   // also no default for a layer split
+            if (o.batch != 0)
+                std::fprintf(stderr, "strata generate: --batch %d is off: VRAM Lend (--vram-lend) runs the serial decode "
+                                     "loop\n", o.batch);
+            o.batch = 0;
         }
     }
 #if defined(STRATA_USE_HIP)
@@ -5872,10 +5905,11 @@ int main(int argc, char** argv) {
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
-                            o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
+                            // (nor is --vram-lend's)
+                            o.batch == 0 && !o.vram_elastic && !o.vram_lend && o.peer_device < 0;
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
-                                     "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
+                                     "every expert in RAM, no --batch, --vram-elastic, --vram-lend or --peer-device)\n");
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
@@ -7049,6 +7083,9 @@ int main(int argc, char** argv) {
             xcache.set_segment_bytes(o.vram_segment_mib << 20);
         }
     }
+    // VRAM Lend: a lease is whole segments of a card's cache, so it takes the same segmented cache on every card (its
+    // own conditions were checked at the start)
+    if (o.vram_lend) xcache.set_segment_bytes(o.vram_segment_mib << 20);
     // STRATA_MMQ_DIRECT: the guard after each sized slot (kept across the retry loop's close/open)
     xcache.set_slot_guard(slot_guard);
     if (slot_guard > 0 && o.expert_cache > 0) {
@@ -7346,7 +7383,7 @@ int main(int argc, char** argv) {
             used += b;
             sized.push_back((int64_t) nib::slot_bytes(pr.first));
         }
-        if (o.vram_elastic) st.cache.set_segment_bytes(o.vram_segment_mib << 20);   // #533: one segmented cache per GPU
+        if (o.vram_elastic || o.vram_lend) st.cache.set_segment_bytes(o.vram_segment_mib << 20);   // #533: one segmented cache per GPU
         // #841: a stage's cache can fail to open with the VRAM free (the card's allocation is also charged to the
         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
         // try said.  Nothing changes when the first open works.
@@ -12171,7 +12208,8 @@ int main(int argc, char** argv) {
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
-                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                        // vram_elastic: the VRAM command can move this cache (--vram-lend segments it for leases only)
+                        (long long) o.tail_role_token, o.vram_elastic && xcache.segmented() ? 1 : 0,
                         // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
                         // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
                         (long long) o.prefill_chunk, sp.stage_count(),
@@ -12181,6 +12219,30 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
         }
+#if !defined(STRATA_USE_HIP)
+        // VRAM Lend: one line per GPU that holds an expert cache, the main card first, then the stages: the engine's
+        // GPU number (as the VRAM command's: 0 is the main card, a later stage its CUDA number) and the PCI address
+        // CUDA gives that card, so the server names a GPU by its address whatever CUDA_VISIBLE_DEVICES and the
+        // config's gpu list are (serve/gpu_map.py).  The log says how each card's cache is segmented.
+        if (o.vram_lend) {
+            std::string segs;
+            auto gpu_line = [&](int dev, int cuda, const strata::core::ExpertCache& c) {
+                char bus[32] = {};
+                if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, cuda) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    std::snprintf(bus, sizeof bus, "-");   // the server leaves out a GPU it cannot name
+                }
+                std::printf("GPU-PCI dev=%d pci=%s\n", dev, bus);
+                segs += (segs.empty() ? "" : ", ") + std::string("GPU ") + std::to_string(dev) + " (CUDA" +
+                        std::to_string(cuda) + ", " + bus + ") " +
+                        (c.segmented() ? std::to_string(c.segments()) + " segments" : std::string("not segmented"));
+            };
+            gpu_line(0, primary_device, xcache);
+            for (const auto& st : stages) gpu_line(st->dev, st->dev, st->cache);
+            std::fprintf(stderr, "strata generate: VRAM Lend: expert caches in segments of %lld MiB: %s\n",
+                         (long long) o.vram_segment_mib, segs.c_str());
+        }
+#endif
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
@@ -12365,6 +12427,10 @@ int main(int argc, char** argv) {
             for (const VramTarget& t : vram_targets())
                 if (want_dev < 0 || t.dev == want_dev) targets.push_back(t);
             if (targets.empty()) { e = "VRAM: this run has no GPU " + std::to_string(want_dev); return false; }
+            if (o.vram_lend && !o.vram_elastic) {   // its segments are for leases: the VRAM command does not move them
+                e = "VRAM needs an engine started with --vram-elastic (--vram-lend segments the caches for its leases)";
+                return false;
+            }
             for (const VramTarget& t : targets)
                 if (!t.cache->segmented()) {
                     e = targets.size() == 1 && t.idx == 0
