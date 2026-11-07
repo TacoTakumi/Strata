@@ -191,11 +191,11 @@ class OnDemandReader(unittest.TestCase):
         svc._vision_up()
         self.assertEqual([x.split("-")[0] for x in v.started], ["gpu", "cpu"])
         self.assertTrue(v.on_cpu)
-        self.assertEqual(engine.calls, [2048, 0])           # the cache made room, then took it back: the CPU reader needs none
+        self.assertEqual(engine.calls, [(2048, None), (0, None)])   # the cache made room, then took it back: the CPU reader needs none
         self.assertFalse(svc.vision_held)
         svc.last_image_at = 0
         self.assertEqual(svc._vision_idle_down(), "down")   # the idle stop ends the CPU reader too ...
-        self.assertEqual(engine.calls, [2048, 0])           # ... and has no VRAM to give back
+        self.assertEqual(engine.calls, [(2048, None), (0, None)])   # ... and has no VRAM to give back
         self.assertFalse(v.on_cpu)                          # the next start tries the card again
         v.gpu_fails = False
         svc._vision_up()                                    # the card is tried again, and works now
